@@ -2334,8 +2334,11 @@ class MainWindow(QMainWindow):
                 # Convert to numeric first to handle any formatting
                 df['time_stamp'] = pd.to_numeric(df['time_stamp'], errors='coerce')
 
-                # Check if timestamps are in milliseconds (13 digits) or seconds (10 digits)
-                sample_ts = df['time_stamp'].iloc[0] if not df.empty else 0
+                # Check if timestamps are in milliseconds (13 digits) or seconds (10 digits),
+                # using the first VALID sample rather than row 0 -- a corrupted/unparseable
+                # first row would otherwise raise on int(nan) and take the whole column down
+                valid_ts = df['time_stamp'].dropna()
+                sample_ts = valid_ts.iloc[0] if not valid_ts.empty else 0
 
                 if len(str(int(sample_ts))) >= 13:  # milliseconds
                     df['time_stamp'] = pd.to_datetime(df['time_stamp'], unit='ms')
@@ -3397,9 +3400,10 @@ class MainWindow(QMainWindow):
                                  f"{tof['dose_dh_worn']:,.1f} D·h"
                                  f" ({tof['excluded_not_worn']:,} not-worn frames excluded)"))
                 if tof['median_vergence'] is not None:
-                    rows.append(("TOF (dioptric)", "Median vergence",
-                                 f"{tof['median_vergence']:.2f} D"
-                                 f" (≈{1000.0 / tof['median_vergence']:.0f} mm)"))
+                    vergence_text = f"{tof['median_vergence']:.2f} D"
+                    if tof['median_vergence'] > 0:
+                        vergence_text += f" (≈{1000.0 / tof['median_vergence']:.0f} mm)"
+                    rows.append(("TOF (dioptric)", "Median vergence", vergence_text))
                 rows.append(("TOF (dioptric)", "Analysis-field yield",
                              f"{tof['yields']['analysis_field_yield'] * 100:.1f}%"))
                 rows.append(("TOF (dioptric)", "Guard-band yield",
