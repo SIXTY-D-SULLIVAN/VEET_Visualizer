@@ -160,7 +160,7 @@ class PlotWindow(QMainWindow):
     def __init__(self, selected_plots, plot_labels, settings, tz_offset, data, device_folder,
                  ALS_wave_col_names, PHO_wave_col_names, ALSgainRatios, PHOgainRatios, phoToScale, phoScales,
                  firmware_info=None, additional_info=None, inf_line=None, serial_number=None,
-                 log_events=None):
+                 log_events=None, wear_windows=None):
         _ensure_core_modules()
         _ensure_matplotlib()
         super().__init__()
@@ -181,6 +181,9 @@ class PlotWindow(QMainWindow):
         self.inf_line = inf_line
         self.serial_number = serial_number
         self.log_events = log_events or {}
+        # Precomputed per-window wear classification (see MainWindow.compute_wear_windows);
+        # None when unavailable (e.g. insufficient IMU data)
+        self.wear_windows = wear_windows
         # Full-resolution data behind display-decimated lines: ax -> [(line, xdat, xnum, y)]
         self._dyn_lines = {}
         self._dyn_axes = set()
@@ -427,7 +430,9 @@ class PlotWindow(QMainWindow):
             tmax_local = tmax.tz_convert(self.tz_offset)
             n_days = (tmax_local - tmin_local).days + 2
             if n_days > 370:
-                print("Skipping day/night shading: time range exceeds one year")
+                message = f"Night shading skipped: loaded time range spans {n_days} days (> 1 year)"
+                print(message)
+                self.statusBar().showMessage(message, 8000)
                 return
 
             first_day = tmin_local.normalize() - pd.Timedelta(days=1)
@@ -1168,6 +1173,28 @@ class PlotWindow(QMainWindow):
                     self.plot_downsampled(ax, imu_data['time_stamp'], imu_data[axis],
                             lw=plot_options['lw'], marker=plot_options['marker'],
                             markersize=plot_options['marker_size'], label=axis)
+
+            self.add_wear_shading(ax)
+
+    def add_wear_shading(self, ax):
+        """Shade windows classified "not worn" (stationary, or excluded because
+        the device was charging -- see MainWindow.compute_wear_windows) directly
+        on the IMU plot, the same way add_night_shading marks time of day."""
+        windows = self.wear_windows
+        if not windows:
+            return
+        window_s = windows.get('window_s', 60)
+        not_worn = windows['monitored'] & ~windows['worn']
+        if not not_worn.any():
+            return
+        first = True
+        for start, flag in zip(windows['window_starts'], not_worn):
+            if not flag:
+                continue
+            end = start + pd.Timedelta(seconds=window_s)
+            ax.axvspan(start, end, facecolor='red', alpha=0.10, zorder=0, linewidth=0,
+                       label='Not Worn' if first else None)
+            first = False
 
     def plot_imu_temp(self, imu_data, ax, plot_options):
         # Flag to track if we displayed any temperature data
@@ -1922,6 +1949,7 @@ class MainWindow(QMainWindow):
             self.firmware_info,
             self.additional_info,
             log_events=self.log_events,
+            wear_windows=self.compute_wear_windows(),
         )
 
         # Show and maximize the plot window properly
@@ -2005,6 +2033,7 @@ class MainWindow(QMainWindow):
             self.firmware_info,
             self.additional_info,
             log_events=self.log_events,
+            wear_windows=self.compute_wear_windows(),
         )
 
         # Maximize the plot window
@@ -2375,6 +2404,25 @@ class MainWindow(QMainWindow):
                     df['time_stamp'] = pd.to_datetime(df['time_stamp'], unit='s')
 
                 df['time_stamp'] = df['time_stamp'].dt.tz_localize('UTC').dt.tz_convert(tz_offset)
+
+                # Reject implausible dates -- a single corrupted/garbled numeric
+                # timestamp elsewhere in the file (not just row 0) can otherwise
+                # land far in the future or past (e.g. year 318857 if a garbage
+                # value gets parsed as epoch seconds). One such row poisons every
+                # min/max-based calculation downstream (night shading's date
+                # range, data extents, session stats) and can crash any code
+                # that later calls strftime on it, since pandas' wide-range
+                # non-nanosecond datetimes exceed what Python's datetime/strftime
+                # supports.
+                min_valid = pd.Timestamp('2000-01-01', tz='UTC')
+                max_valid = pd.Timestamp('2100-01-01', tz='UTC')
+                implausible = (df['time_stamp'] < min_valid) | (df['time_stamp'] > max_valid)
+                if implausible.any():
+                    n_bad = int(implausible.sum())
+                    df.loc[implausible, 'time_stamp'] = pd.NaT
+                    print(f"{keyword}: dropped {n_bad} row(s) with an implausible timestamp")
+                    if warnings is not None:
+                        warnings.append(f"{keyword}: {n_bad} row(s) had an implausible timestamp and were dropped")
             except Exception as e:
                 print(f"Error converting timestamps: {e}")
                 if warnings is not None:
@@ -3069,6 +3117,7 @@ class MainWindow(QMainWindow):
             'monitored': monitored.to_numpy(),
             'credit_s': credit_s.to_numpy(dtype=float),
             'interval': interval,
+            'window_s': self.WEAR_WINDOW_S,
             'charging': charging,
             'excluded_charging': excluded_charging,
         }
@@ -3665,7 +3714,8 @@ class MainWindow(QMainWindow):
                 self.additional_info,
                 self.inf_line,
                 self.serial_number,
-                log_events=self.log_events
+                log_events=self.log_events,
+                wear_windows=self.compute_wear_windows()
             )
             progress.close()
             print("Plot windows generated successfully")
