@@ -2976,16 +2976,23 @@ class MainWindow(QMainWindow):
     WEAR_MIN_SAMPLES_PER_WINDOW = 5    # windows with fewer samples are ignored
 
     def compute_wear_windows(self):
-        """Per-window wear classification from IMU accelerometer variance.
+        """Per-window wear classification from IMU accelerometer variance,
+        screened by charger state.
 
         The session is cut into WEAR_WINDOW_S windows; a window whose combined
         3-axis acceleration standard deviation is below WEAR_STD_THRESHOLD is
         classified "not worn" (device stationary), anything above it "worn".
         Windows inside data gaps are unmonitored and counted as neither.
 
+        The device charges on wall power and cannot be worn while doing so, so
+        any window where get_charging_state() reports the charger connected is
+        forced out of "worn" regardless of accelerometer variance (e.g. a
+        charging dock getting bumped shouldn't count as wear).
+
         Returns a dict of aligned per-window arrays (window_starts, worn,
-        monitored, credit_s) for aggregation and for upstream gating of other
-        sensors (e.g. excluding not-worn periods from TOF dioptric stats).
+        monitored, credit_s, charging, excluded_charging) for aggregation and
+        for upstream gating of other sensors (e.g. excluding not-worn periods
+        from TOF dioptric stats).
         """
         imu = self.data.get('IMU')
         accel_cols = ['Acc_x', 'Acc_y', 'Acc_z']
@@ -3014,17 +3021,27 @@ class MainWindow(QMainWindow):
 
         monitored = counts >= self.WEAR_MIN_SAMPLES_PER_WINDOW
         combined_std = np.sqrt((stds ** 2).sum(axis=1))
-        worn = monitored & (combined_std > self.WEAR_STD_THRESHOLD)
+        worn_by_motion = (monitored & (combined_std > self.WEAR_STD_THRESHOLD)).to_numpy()
+
+        window_starts = pd.DatetimeIndex(monitored.index)
+        charging, _ = self.get_charging_state(window_starts)
+        if charging is None:
+            charging = np.zeros(len(window_starts), dtype=bool)
+
+        worn = worn_by_motion & ~charging
+        excluded_charging = worn_by_motion & charging
 
         # Credit each window with its sampled time, capped at the window length
         credit_s = (counts * interval).clip(upper=self.WEAR_WINDOW_S)
 
         return {
-            'window_starts': pd.DatetimeIndex(worn.index),
-            'worn': worn.to_numpy(),
+            'window_starts': window_starts,
+            'worn': worn,
             'monitored': monitored.to_numpy(),
             'credit_s': credit_s.to_numpy(dtype=float),
             'interval': interval,
+            'charging': charging,
+            'excluded_charging': excluded_charging,
         }
 
     def compute_wear_stats(self):
@@ -3035,11 +3052,13 @@ class MainWindow(QMainWindow):
         worn = windows['worn']
         monitored = windows['monitored']
         credit_s = windows['credit_s']
+        excluded_charging = windows['excluded_charging']
 
         worn_s = float(credit_s[worn].sum())
         not_worn_s = float(credit_s[monitored & ~worn].sum())
         monitored_s = worn_s + not_worn_s
         wear_pct = worn_s / monitored_s * 100.0 if monitored_s > 0 else None
+        excluded_charging_s = float(credit_s[excluded_charging].sum())
 
         daily = []
         window_dates = windows['window_starts'].tz_convert(self.tz_offset).date
@@ -3053,6 +3072,7 @@ class MainWindow(QMainWindow):
             'worn_hours': worn_s / 3600.0,
             'not_worn_hours': not_worn_s / 3600.0,
             'wear_pct': wear_pct,
+            'excluded_charging_hours': excluded_charging_s / 3600.0,
             'daily': daily,
             'window_s': self.WEAR_WINDOW_S,
             'threshold': self.WEAR_STD_THRESHOLD,
@@ -3061,6 +3081,59 @@ class MainWindow(QMainWindow):
     # Battery analytics parameters
     BAT_GAP_PAIR_LIMIT_S = 600         # ignore sample pairs spanning > 10 min
     CHARGE_SLOPE_MV_PER_H = 20.0       # smoothed rise above this = on charger (heuristic)
+
+    def get_charging_state(self, query_times):
+        """Boolean array: is the device on charger power at each of query_times?
+
+        VBUS events from log.csv are authoritative when present (firmware-
+        reported USB/wall power connection). Falls back to the same smoothed
+        BAT voltage-rise heuristic used in compute_battery_stats (rise faster
+        than CHARGE_SLOPE_MV_PER_H) when no VBUS events exist. Returns
+        (None, None) if neither source is available (e.g. no BAT data loaded).
+        """
+        if len(query_times) == 0:
+            return np.zeros(0, dtype=bool), None
+        query_epoch = np.array([ts.timestamp() for ts in query_times])
+
+        vbus = self.log_events.get('vbus', {})
+        vbus_events = sorted([(ts, 1) for ts in vbus.get('1', [])] +
+                             [(ts, 0) for ts in vbus.get('0', [])])
+        if vbus_events:
+            event_times = np.array([e[0] for e in vbus_events], dtype=float)
+            event_states = np.array([e[1] for e in vbus_events])
+            idx = np.searchsorted(event_times, query_epoch, side='right') - 1
+            # Before the first event, assume the opposite of that event's state
+            state_before_first = 1 - vbus_events[0][1]
+            states = np.where(idx >= 0, event_states[np.clip(idx, 0, None)], state_before_first)
+            return states.astype(bool), "VBUS events"
+
+        bat = self.data.get('BAT')
+        if bat is None or bat.empty or 'time_stamp' not in bat.columns or 'Voltage' not in bat.columns:
+            return None, None
+        if not pd.api.types.is_datetime64_any_dtype(bat['time_stamp']):
+            return None, None
+        df = bat[['time_stamp', 'Voltage']].copy()
+        df['Voltage'] = pd.to_numeric(df['Voltage'], errors='coerce')
+        df = df.dropna().sort_values('time_stamp').reset_index(drop=True)
+        if len(df) < 3:
+            return None, None
+
+        t = df['time_stamp']
+        v = df['Voltage']
+        t_prev = t.iloc[:-1].reset_index(drop=True)
+        t_next = t.iloc[1:].reset_index(drop=True)
+        dt_hours = (t_next - t_prev).dt.total_seconds() / 3600.0
+        v_smooth = v.rolling(9, center=True, min_periods=1).median()
+        dv_smooth = (v_smooth.iloc[1:].reset_index(drop=True)
+                     - v_smooth.iloc[:-1].reset_index(drop=True))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            slope = dv_smooth / dt_hours
+        pair_charging = (slope > self.CHARGE_SLOPE_MV_PER_H).to_numpy()
+        pair_mid_epoch = np.array([ts.timestamp() for ts in (t_prev + (t_next - t_prev) / 2)])
+
+        idx = np.searchsorted(pair_mid_epoch, query_epoch, side='right') - 1
+        idx = np.clip(idx, 0, len(pair_charging) - 1)
+        return pair_charging[idx], "voltage-rise heuristic"
 
     def compute_battery_stats(self):
         """Discharge rate, runtime estimate, charger vs battery time, charge cycles.
@@ -3090,30 +3163,17 @@ class MainWindow(QMainWindow):
         dv = v.iloc[1:].reset_index(drop=True) - v.iloc[:-1].reset_index(drop=True)
         valid = (dt_hours > 0) & (dt_hours <= self.BAT_GAP_PAIR_LIMIT_S / 3600.0)
 
-        vbus = self.log_events.get('vbus', {})
-        vbus_events = sorted([(ts, 1) for ts in vbus.get('1', [])] +
-                             [(ts, 0) for ts in vbus.get('0', [])])
-        if vbus_events:
-            charger_source = "VBUS events"
-            midpoints = t_prev + (t_next - t_prev) / 2
-            mid_epoch = np.array([ts.timestamp() for ts in midpoints])
-            event_times = np.array([e[0] for e in vbus_events], dtype=float)
-            event_states = np.array([e[1] for e in vbus_events])
-            idx = np.searchsorted(event_times, mid_epoch, side='right') - 1
-            # Before the first event, assume the opposite of that event's state
-            state_before_first = 1 - vbus_events[0][1]
-            states = np.where(idx >= 0, event_states[np.clip(idx, 0, None)], state_before_first)
-            charging = pd.Series(states.astype(bool))
+        midpoints = t_prev + (t_next - t_prev) / 2
+        charging_arr, charger_source = self.get_charging_state(midpoints)
+        charging = pd.Series(charging_arr)
+
+        if charger_source == "VBUS events":
+            vbus = self.log_events.get('vbus', {})
+            vbus_events = sorted([(ts, 1) for ts in vbus.get('1', [])] +
+                                 [(ts, 0) for ts in vbus.get('0', [])])
             charge_cycles = sum(1 for i, (ts, state) in enumerate(vbus_events)
                                 if state == 1 and (i == 0 or vbus_events[i - 1][1] == 0))
         else:
-            charger_source = "voltage-rise heuristic"
-            v_smooth = v.rolling(9, center=True, min_periods=1).median()
-            dv_smooth = (v_smooth.iloc[1:].reset_index(drop=True)
-                         - v_smooth.iloc[:-1].reset_index(drop=True))
-            with np.errstate(divide='ignore', invalid='ignore'):
-                slope = dv_smooth / dt_hours
-            charging = slope > self.CHARGE_SLOPE_MV_PER_H
             # Charge cycles = distinct runs of >= 3 consecutive charging pairs
             charge_cycles = 0
             run_length = 0
@@ -3246,8 +3306,11 @@ class MainWindow(QMainWindow):
         wear = stats.get('wear')
         if wear and wear['wear_pct'] is not None:
             monitored_hours = wear['worn_hours'] + wear['not_worn_hours']
-            lines.append(f"Wear: {wear['worn_hours']:.1f} h worn of "
+            wear_line = (f"Wear: {wear['worn_hours']:.1f} h worn of "
                          f"{monitored_hours:.1f} h monitored ({wear['wear_pct']:.0f}%)")
+            if wear['excluded_charging_hours'] > 0:
+                wear_line += f"; {wear['excluded_charging_hours']:.1f} h excluded (charging)"
+            lines.append(wear_line)
 
         tof = stats.get('tof')
         if tof:
@@ -3382,11 +3445,15 @@ class MainWindow(QMainWindow):
                              self.format_duration(wear['worn_hours'] * 3600) + pct_text))
                 rows.append(("Wear (IMU)", "Not worn",
                              self.format_duration(wear['not_worn_hours'] * 3600)))
+                if wear['excluded_charging_hours'] > 0:
+                    rows.append(("Wear (IMU)", "Excluded (charging)",
+                                 self.format_duration(wear['excluded_charging_hours'] * 3600)))
                 for day, day_worn, day_monitored in wear['daily']:
                     rows.append(("Wear (IMU)", f"Daily {day}",
                                  f"{day_worn:.1f} h worn of {day_monitored:.1f} h monitored"))
                 rows.append(("Wear (IMU)", "Detection",
-                             f"{wear['window_s']}s windows, accel std < {wear['threshold']} m/s² = not worn"))
+                             f"{wear['window_s']}s windows, accel std < {wear['threshold']} m/s² = not worn; "
+                             f"charging windows always forced not-worn"))
 
             tof = stats.get('tof')
             if tof:
