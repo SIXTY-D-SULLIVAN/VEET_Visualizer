@@ -87,7 +87,7 @@ import csv
 import json
 import threading
 from PySide6.QtCore import Qt, QCoreApplication, QThread, Signal, QTimer, QSettings, QDateTime
-from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QCheckBox, QFileDialog, QMainWindow, QComboBox, QMessageBox, QLineEdit, QProgressDialog, QDateTimeEdit, QSplashScreen, QDockWidget, QTableWidget, QTableWidgetItem, QHeaderView
+from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, QLabel, QCheckBox, QFileDialog, QMainWindow, QComboBox, QMessageBox, QLineEdit, QProgressDialog, QDateTimeEdit, QSplashScreen, QDockWidget, QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox, QScrollArea
 from PySide6.QtGui import QClipboard, QPixmap, QColor
 
 # numpy/pandas/pytz and matplotlib are imported lazily so the GUI can show a
@@ -1570,14 +1570,19 @@ class MainWindow(QMainWindow):
         self.initUI()
 
     def initUI(self):
-        layout = QVBoxLayout()
+        content = QWidget()
+        layout = QVBoxLayout(content)
+
+        # --- Data ---
+        data_group = QGroupBox("Data", self)
+        data_layout = QVBoxLayout(data_group)
 
         self.btn_select_folder = QPushButton("Select Folder && Load Data", self)
         self.btn_select_folder.clicked.connect(self.select_folder)
-        layout.addWidget(self.btn_select_folder)
+        data_layout.addWidget(self.btn_select_folder)
 
         self.label_folder = QLabel("Folder not selected", self)
-        layout.addWidget(self.label_folder)
+        data_layout.addWidget(self.label_folder)
 
         # Data summary panel: SN, firmware, extents, record counts, warnings
         self.summary_label = QLabel("No data loaded — select or drop a device folder", self)
@@ -1586,57 +1591,51 @@ class MainWindow(QMainWindow):
             "padding: 6px; font-family: Consolas, monospace; font-size: 11px;")
         self.summary_label.setWordWrap(True)
         self.summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        layout.addWidget(self.summary_label)
+        data_layout.addWidget(self.summary_label)
 
+        layout.addWidget(data_group)
+
+        # --- Plot selection: each option's checkbox, with its log-scale
+        # companion (if any) on the same row instead of a row below it ---
+        plot_group = QGroupBox("Plot Selection", self)
+        plot_layout = QVBoxLayout(plot_group)
+
+        scale_option_for = {
+            'ALS Lux': ('ALS_lux', "Use Log Scale for ALS Lux"),
+            'ALS Basic Counts': ('ALS_wave', "Use Log Scale for ALS Basic Counts"),
+            'PHO Basic Counts': ('PHO', "Use Log Scale for PHO Basic Counts"),
+        }
         self.checkboxes = []
         self.scale_checkboxes = {}
         for plot_option in ['Battery Voltage', 'Battery Voltage Change Over Time', 'Sensor Sample Interval', 'System Temperature (IMU)', 'TOF Average Distance', 'ALS Lux', 'ALS Basic Counts', 'PHO Basic Counts', 'IMU Translational Acceleration']:
+            row = QHBoxLayout()
             cb = QCheckBox(plot_option, self)
             # Set Battery Voltage to be checked by default
             if plot_option == 'Battery Voltage':
                 cb.setChecked(True)
             cb.stateChanged.connect(self.update_selected_plots)
-            layout.addWidget(cb)
             self.checkboxes.append(cb)
-            
-            # Add scale option checkboxes directly below their corresponding plots
-            if plot_option == 'ALS Lux':
-                scale_cb = QCheckBox("Use Log Scale for ALS Lux", self)
-                scale_cb.setStyleSheet("margin-left: 20px;")
-                scale_cb.setChecked(self.settings['useLogScale']['ALS_lux'])
-                scale_cb.stateChanged.connect(lambda state, pt='ALS_lux': self.update_scale_setting(pt, state))
-                layout.addWidget(scale_cb)
-                self.scale_checkboxes['ALS_lux'] = scale_cb
-            elif plot_option == 'ALS Basic Counts':
-                scale_cb = QCheckBox("Use Log Scale for ALS Basic Counts", self)
-                scale_cb.setStyleSheet("margin-left: 20px;")
-                scale_cb.setChecked(self.settings['useLogScale']['ALS_wave'])
-                scale_cb.stateChanged.connect(lambda state, pt='ALS_wave': self.update_scale_setting(pt, state))
-                layout.addWidget(scale_cb)
-                self.scale_checkboxes['ALS_wave'] = scale_cb
-            elif plot_option == 'PHO Basic Counts':
-                scale_cb = QCheckBox("Use Log Scale for PHO Basic Counts", self)
-                scale_cb.setStyleSheet("margin-left: 20px;")
-                scale_cb.setChecked(self.settings['useLogScale']['PHO'])
-                scale_cb.stateChanged.connect(lambda state, pt='PHO': self.update_scale_setting(pt, state))
-                layout.addWidget(scale_cb)
-                self.scale_checkboxes['PHO'] = scale_cb
-        
-        # Add visual separator between plot options and time controls
-        separator = QLabel(self)
-        separator.setStyleSheet("border-top: 1px solid #d0d0d0; margin: 10px 0px 5px 0px;")
-        separator.setFixedHeight(1)
-        layout.addWidget(separator)
-        
-        # Add X-axis time range control (including timezone)
-        x_axis_layout = QVBoxLayout()
-        x_axis_label = QLabel("X-Axis Time Range Control:", self)
-        x_axis_layout.addWidget(x_axis_label)
+            row.addWidget(cb)
 
-        # Timezone selection as part of X-axis controls
-        timezone_label = QLabel("Select Timezone Offset (hours from GMT):", self)
-        x_axis_layout.addWidget(timezone_label)
-        
+            if plot_option in scale_option_for:
+                settings_key, label = scale_option_for[plot_option]
+                scale_cb = QCheckBox(label, self)
+                scale_cb.setChecked(self.settings['useLogScale'][settings_key])
+                scale_cb.stateChanged.connect(lambda state, pt=settings_key: self.update_scale_setting(pt, state))
+                row.addWidget(scale_cb)
+                self.scale_checkboxes[settings_key] = scale_cb
+
+            row.addStretch(1)
+            plot_layout.addLayout(row)
+
+        layout.addWidget(plot_group)
+
+        # --- X-axis time range control (including timezone) ---
+        time_group = QGroupBox("X-Axis Time Range Control", self)
+        x_axis_layout = QVBoxLayout(time_group)
+
+        tz_layout = QHBoxLayout()
+        tz_layout.addWidget(QLabel("Timezone offset (GMT):", self))
         self.timezone_combo = QComboBox(self)        # Populate with timezone options from -12 to +14
         for i in range(-12, 15):
             self.timezone_combo.addItem(f"GMT{'+' if i >= 0 else ''}{i}", i)
@@ -1646,7 +1645,8 @@ class MainWindow(QMainWindow):
         if index >= 0:
             self.timezone_combo.setCurrentIndex(index)
         self.timezone_combo.currentIndexChanged.connect(self.update_timezone)
-        x_axis_layout.addWidget(self.timezone_combo)
+        tz_layout.addWidget(self.timezone_combo, 1)
+        x_axis_layout.addLayout(tz_layout)
 
         hours_layout = QHBoxLayout()
         hours_label = QLabel("Hours to display:", self)
@@ -1657,7 +1657,7 @@ class MainWindow(QMainWindow):
         hours_layout.addWidget(hours_label)
         hours_layout.addWidget(self.hours_input)
         x_axis_layout.addLayout(hours_layout)
-        
+
         # Add the new hours offset control
         offset_layout = QHBoxLayout()
         offset_label = QLabel("Hours offset from end:", self)
@@ -1690,45 +1690,49 @@ class MainWindow(QMainWindow):
         range_layout.addWidget(self.range_end_edit)
         x_axis_layout.addLayout(range_layout)
 
-        layout.addLayout(x_axis_layout)
+        layout.addWidget(time_group)
 
-        # Add visual separator between time controls and action buttons
-        separator2 = QLabel(self)
-        separator2.setStyleSheet("border-top: 1px solid #d0d0d0; margin: 10px 0px 5px 0px;")
-        separator2.setFixedHeight(1)
-        layout.addWidget(separator2)
+        # --- Actions ---
+        action_group = QGroupBox("Actions", self)
+        action_layout = QGridLayout(action_group)
 
         self.btn_show_plot = QPushButton("Show Plot", self)
         self.btn_show_plot.clicked.connect(self.show_plot_window)
-        layout.addWidget(self.btn_show_plot)
+        action_layout.addWidget(self.btn_show_plot, 0, 0)
 
         self.btn_tof_analysis = QPushButton("TOF Dioptric Analysis", self)
         self.btn_tof_analysis.clicked.connect(self.show_tof_analysis)
-        layout.addWidget(self.btn_tof_analysis)
+        action_layout.addWidget(self.btn_tof_analysis, 0, 1)
 
         self.btn_export_tof_arrays = QPushButton("Export TOF Arrays (.npz)", self)
         self.btn_export_tof_arrays.clicked.connect(self.export_tof_arrays)
-        layout.addWidget(self.btn_export_tof_arrays)
+        action_layout.addWidget(self.btn_export_tof_arrays, 1, 0)
 
-        # Add Export Plot button
+        self.btn_export_plot = QPushButton("Export Plot", self)
+        self.btn_export_plot.clicked.connect(self.export_plot)
+        action_layout.addWidget(self.btn_export_plot, 1, 1)
+
         self.stamp_stats_cb = QCheckBox("Stamp session statistics on exported PNGs", self)
         self.stamp_stats_cb.setChecked(self.settings.get('stamp_stats', False))
         self.stamp_stats_cb.stateChanged.connect(
             lambda state: self.settings.__setitem__('stamp_stats', state == 2))
-        layout.addWidget(self.stamp_stats_cb)
+        action_layout.addWidget(self.stamp_stats_cb, 2, 0, 1, 2)
 
-        self.btn_export_plot = QPushButton("Export Plot", self)
-        self.btn_export_plot.clicked.connect(self.export_plot)
-        layout.addWidget(self.btn_export_plot)
-
-        # Add Export all Plots button - renamed for clarity
+        # Renamed for clarity; spans both columns since it's a lower-priority/deprecated action
         self.btn_export_all_plots = QPushButton("Export All Subdirectory Plots (deprecated function)", self)
         self.btn_export_all_plots.clicked.connect(self.export_all_plots)
-        layout.addWidget(self.btn_export_all_plots)
+        action_layout.addWidget(self.btn_export_all_plots, 3, 0, 1, 2)
 
-        central_widget = QWidget()
-        central_widget.setLayout(layout)
-        self.setCentralWidget(central_widget)
+        layout.addWidget(action_group)
+        layout.addStretch(1)
+
+        # Scroll area so the control panel can be shrunk below its natural
+        # content height on small screens instead of forcing the window to
+        # grow to fit every control
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(content)
+        self.setCentralWidget(scroll)
 
         # Dockable session-statistics table (hidden until data loads)
         self._init_stats_dock()
@@ -1736,11 +1740,35 @@ class MainWindow(QMainWindow):
         # Accept a device folder dropped anywhere on the window
         self.setAcceptDrops(True)
 
+        # Standard window behavior: fit on-screen and stay resizable, and
+        # remember size/position/maximized state across launches like any
+        # other Windows application (restore_preferences below handles the
+        # rest of the persisted settings)
+        self.setMinimumSize(360, 320)
+        self._apply_initial_window_geometry()
+
         # Restore persisted preferences (may change checkbox states)
         self.restore_preferences()
 
         # Initialize selected plots to capture any checkboxes that are checked by default
         self.update_selected_plots()
+
+    def _apply_initial_window_geometry(self):
+        """Restore the last saved window size/position/maximized state, or
+        fall back to a default sized to fit on the available screen (rather
+        than growing to fit the full control panel content)."""
+        qsettings = QSettings("VEET", "VEET_Data_Charting")
+        geometry = qsettings.value("window_geometry")
+        if geometry is not None and self.restoreGeometry(geometry):
+            return
+        screen = self.screen()
+        avail = screen.availableGeometry() if screen else None
+        if avail is not None:
+            width = min(480, avail.width() - 40)
+            height = min(880, avail.height() - 80)
+        else:
+            width, height = 480, 800
+        self.resize(width, height)
 
     def dragEnterEvent(self, event):
         urls = event.mimeData().urls()
@@ -1804,6 +1832,7 @@ class MainWindow(QMainWindow):
         qsettings.setValue("hours_to_display", self.settings['hours_to_display'])
         qsettings.setValue("hours_offset", self.settings['hours_offset'])
         qsettings.setValue("stamp_stats", self.stamp_stats_cb.isChecked())
+        qsettings.setValue("window_geometry", self.saveGeometry())
 
     def closeEvent(self, event):
         self.save_preferences()
