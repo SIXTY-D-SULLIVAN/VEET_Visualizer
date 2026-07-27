@@ -51,6 +51,32 @@ CONF_MAX = 255
 # regardless of reported confidence.
 Z_FLOOR_MM = 20.0
 
+# The sensor's minimum reporting distance: it cannot produce a genuine
+# time-of-flight return below this. A reading here -- including exactly 0 --
+# is a no-return artifact (e.g. nothing in range), not a real near-field
+# measurement, and is deterministically reinterpreted as far/optical infinity
+# rather than dropped as invalid. This is unconditional (not confidence-gated):
+# the confidence byte accompanying a sub-floor reading was calibrated for the
+# near-field SNR interpretation, which no longer applies once the distance
+# itself is known to be a floor artifact.
+NO_RETURN_FLOOR_MM = 10.0
+
+# Finite stand-in for "no return" -- avoids inf breaking isfinite() checks
+# elsewhere. Lands exactly on the far band's near edge (BANDS[7], inclusive),
+# and to_diopters clips anything >= 2000 mm to the same 0.5 D floor regardless
+# of exact magnitude, so the stand-in's precise value doesn't matter beyond
+# landing in the far band.
+NO_RETURN_SENTINEL_MM = 2000.0
+
+
+def _resolve_no_return(z_mm: np.ndarray) -> np.ndarray:
+    """Reinterpret sub-floor distances (no real return) as far/optical infinity.
+
+    NaN and in-range values pass through unchanged (NaN < floor is False).
+    """
+    z = np.asarray(z_mm, dtype=float)
+    return np.where(z < NO_RETURN_FLOOR_MM, NO_RETURN_SENTINEL_MM, z)
+
 # --- Grid geometry ---------------------------------------------------------
 GRID_SHAPE = (8, 8)
 
@@ -213,7 +239,7 @@ _MIN_RAW = np.array([b.conf_raw for b in BANDS], dtype=np.int16)
 
 def band_index(z_mm: np.ndarray) -> np.ndarray:
     """Map distances (mm) to band indices 0-7. Shape-preserving."""
-    return np.searchsorted(_EDGES, np.asarray(z_mm, dtype=float), side="right")
+    return np.searchsorted(_EDGES, _resolve_no_return(z_mm), side="right")
 
 
 def min_confidence(z_mm: np.ndarray) -> np.ndarray:
@@ -223,6 +249,10 @@ def min_confidence(z_mm: np.ndarray) -> np.ndarray:
 
 def valid_mask(z_mm: np.ndarray, conf_raw: np.ndarray) -> np.ndarray:
     """Boolean mask of zones passing the distance-dependent confidence gate.
+
+    Sub-floor readings (< NO_RETURN_FLOOR_MM, including 0) are a deterministic
+    no-return artifact and are always valid-far, independent of the confidence
+    gate -- see NO_RETURN_FLOOR_MM.
 
     Parameters
     ----------
@@ -237,8 +267,11 @@ def valid_mask(z_mm: np.ndarray, conf_raw: np.ndarray) -> np.ndarray:
     c = np.asarray(conf_raw)
     if z.shape != c.shape:
         raise ValueError(f"shape mismatch: z_mm {z.shape} vs conf_raw {c.shape}")
-    finite = np.isfinite(z) & (z >= Z_FLOOR_MM)
-    return finite & (c >= min_confidence(z))
+    no_return = z < NO_RETURN_FLOOR_MM
+    z_resolved = _resolve_no_return(z)
+    finite = np.isfinite(z_resolved) & (z_resolved >= Z_FLOOR_MM)
+    gated = finite & (c >= min_confidence(z_resolved))
+    return no_return | gated
 
 
 def _neighbor_count(mask: np.ndarray, connectivity: int = 8) -> np.ndarray:
@@ -348,9 +381,10 @@ def to_diopters(z_mm: np.ndarray, z_cap_mm: float = 2000.0) -> np.ndarray:
 
     Returns beyond ``z_cap_mm`` are censored to the cap rather than allowed to
     approach zero asymptotically, since the sensor cannot distinguish 3 m from
-    10 m and both are optically equivalent for accommodative demand.
+    10 m and both are optically equivalent for accommodative demand. Sub-floor
+    (no-return) readings are resolved the same way -- see NO_RETURN_FLOOR_MM.
     """
-    z = np.asarray(z_mm, dtype=float)
+    z = _resolve_no_return(z_mm)
     return 1000.0 / np.clip(z, Z_FLOOR_MM, z_cap_mm)
 
 

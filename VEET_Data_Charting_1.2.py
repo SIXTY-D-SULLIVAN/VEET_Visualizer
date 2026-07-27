@@ -927,17 +927,29 @@ class PlotWindow(QMainWindow):
                 # Filter distances based on confidence threshold - Create a copy to avoid fragmentation
                 tof_data_filtered = tof_data.copy()
                 conf_threshold = self.settings.get('conf_thresh', 0)
-                
-                # Create a mask for points with confidence above threshold
-                valid_points = np.ones(tof_data.shape[0], dtype=bool)
-                
+
                 for i, conf_col in enumerate(conf_cols):
                     if i < len(dist_cols):
                         dist_col = dist_cols[i]
                         # Set distance to NaN where confidence is below threshold
                         mask = tof_data[conf_col] < conf_threshold
                         tof_data_filtered.loc[mask, dist_col] = np.nan
-                        
+
+                # Sub-floor readings (including 0) are a no-return artifact, not
+                # a real near-field measurement -- reinterpret as far/optical
+                # infinity (matching veet_tof_bands.NO_RETURN_FLOOR_MM) instead
+                # of letting them drag the average toward "very close". Checked
+                # against the raw distance (unconditional, like valid_mask's
+                # no-return handling) so it isn't masked out by the confidence
+                # filter above -- a sub-floor reading is a deterministic sensor
+                # artifact regardless of its accompanying confidence byte.
+                tof_bands = _import_tof_bands()
+                no_return_floor = tof_bands.NO_RETURN_FLOOR_MM if tof_bands else 10.0
+                no_return_sentinel = tof_bands.NO_RETURN_SENTINEL_MM if tof_bands else 2000.0
+                for dist_col in dist_cols:
+                    no_return = tof_data[dist_col] < no_return_floor
+                    tof_data_filtered.loc[no_return, dist_col] = no_return_sentinel
+
                 # Calculate average distance (ignoring NaNs) - Pre-calculate this before adding to dataframe
                 avg_dist = tof_data_filtered[dist_cols].mean(axis=1)
                 
