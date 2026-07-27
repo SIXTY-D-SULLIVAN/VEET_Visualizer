@@ -2640,8 +2640,14 @@ class MainWindow(QMainWindow):
                         else:
                             discarded += 1
 
-                # Special handling for REBOOT entries
-                if 'REBOOT' in line or 'config.json' in line or 'calib.json' in line:
+                # Special handling for REBOOT entries. Deliberately excludes the
+                # config.json/calib.json lines the firmware dumps right after
+                # each reboot (same timestamp, same burst) -- those aren't
+                # reboot events themselves and previously inflated every real
+                # reboot into 9 counted rows (1 REBOOT + 4 config.json + 4
+                # calib.json), badly overcounting reboot stats and cluttering
+                # the Battery Voltage plot with duplicate reboot markers.
+                if ',REBOOT,' in line:
                     processed_line = self.process_line(line)
                     if processed_line:
                         items = processed_line.split(',')
