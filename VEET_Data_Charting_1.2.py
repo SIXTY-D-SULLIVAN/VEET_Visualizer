@@ -34,8 +34,7 @@ Key Features:
   • Reboot event markers
 - Gain and integration time normalization for ALS and PHO data with accurate calibration factors
 - Logarithmic or linear scale options for ALS Lux, ALS Basic Counts, and PHO Basic Counts
-- Export plots as PNG images for reports (individual or batch processing)
-- Batch processing capability for multiple device folders
+- Export plots as PNG images for reports
 - Optimized legends with proper placement to avoid overlap with data
 - Interactive legends for PHO Basic Counts plots - click to show/hide data series
 - Draggable legends for better plot viewing
@@ -58,7 +57,7 @@ When running the script a GUI window will open to:
 5. Set visualization options (timezone, time range, display window)
 6. Generate interactive plot windows with the selected data
    *Note: Plot generation shows a progress dialog and can take several seconds for large datasets or multiple plots*
-7. Export plots individually or in batch mode
+7. Export plots as PNG images
 
 The script expects the following input files in the selected folder:
 - Any file ending with "log.csv" (e.g., "2025-08-03 23-46 log.csv")
@@ -1757,11 +1756,6 @@ class MainWindow(QMainWindow):
             lambda state: self.settings.__setitem__('stamp_stats', state == 2))
         action_layout.addWidget(self.stamp_stats_cb, 2, 0, 1, 2)
 
-        # Renamed for clarity; spans both columns since it's a lower-priority/deprecated action
-        self.btn_export_all_plots = QPushButton("Export All Subdirectory Plots (deprecated function)", self)
-        self.btn_export_all_plots.clicked.connect(self.export_all_plots)
-        action_layout.addWidget(self.btn_export_all_plots, 3, 0, 1, 2)
-
         layout.addWidget(action_group)
         layout.addStretch(1)
 
@@ -1876,56 +1870,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.save_preferences()
         super().closeEvent(event)
-    
-    def export_all_plots(self):
-        """Batch export charts for all subdirectories of a given directory."""
-        # Capture the CURRENT plot selections from the GUI (not just startup defaults)
-        self.update_selected_plots()
-        
-        # Check if any plots are selected before proceeding
-        if not self.selected_plots:
-            QMessageBox.warning(self, "No Plots Selected", "Please select at least one plot type before exporting.")
-            return
-            
-        print(f"Batch exporting with CURRENT selected plots: {self.selected_plots}")
-        print(f"(Based on what you have checked in the GUI right now)")
-        
-        root_directory = QFileDialog.getExistingDirectory(self, "Select Root Directory")
-        if not root_directory:
-            return
-
-        subdirectories = [os.path.join(root_directory, d) for d in os.listdir(root_directory) if os.path.isdir(os.path.join(root_directory, d))]
-        if not subdirectories:
-            QMessageBox.information(self, "No Subdirectories", "No subdirectories found in the selected directory.")
-            return
-
-        for subdir in subdirectories:
-            self.label_folder.setText(subdir)
-            try:
-                print(f"Loading data from: {subdir}")
-                self.load_data()
-                
-                # Check if we have selected plots and data
-                if not self.selected_plots:
-                    print(f"Warning: No plots selected for {subdir}")
-                    continue
-                    
-                # Check if we have data
-                if not self.data:
-                    print(f"Warning: No data loaded for {subdir}")
-                    continue
-                
-                print(f"Data loaded successfully. Selected plots: {self.selected_plots}")
-                
-                # Get subdirectory name for unique filename
-                subdir_name = os.path.basename(subdir)
-                # Call export with the root directory and subdirectory name
-                self.export_plot_batch(root_directory, subdir_name)
-            except Exception as e:
-                print(f"Error processing directory {subdir}: {e}")
-                continue
-
-        QMessageBox.information(self, "Batch Export Complete", "All plots have been exported.")
 
     def _stamp_stats_on_figure(self, fig):
         """Stamp the session statistics in the bottom-left of an exported figure."""
@@ -1936,90 +1880,6 @@ class MainWindow(QMainWindow):
             fig.text(0.01, 0.005, stamp_text, fontsize=6.5, family='monospace',
                      ha='left', va='bottom', color='#303030',
                      bbox=dict(facecolor='white', alpha=0.75, boxstyle='round,pad=0.3'))
-
-    def export_plot_batch(self, save_directory, subdir_name):
-        """Export plot for batch processing with custom directory and filename."""
-        if self.device_folder == "Unknown_Device":
-            serial_number = self.get_serial_number_from_inf(self.label_folder.text())
-            if serial_number:
-                self.device_folder = f"Unknown_Device (SN: {serial_number})"
-
-        # Create the plot window
-        self.plot_window = PlotWindow(
-            self.selected_plots,
-            self.plot_labels,
-            self.settings,
-            self.tz_offset,
-            self.data,
-            self.device_folder,
-            self.ALS_wave_col_names,
-            self.PHO_wave_col_names,
-            self.ALSgainRatios,
-            self.PHOgainRatios,
-            self.phoToScale,
-            self.phoScales,
-            self.firmware_info,
-            self.additional_info,
-            log_events=self.log_events,
-            wear_windows=self.compute_wear_windows(),
-        )
-
-        # Show and maximize the plot window properly
-        self.plot_window.show()
-        QApplication.processEvents()  # Ensure GUI updates
-        self.plot_window.showMaximized()
-        QApplication.processEvents()  # Ensure maximization is processed
-        
-        # Wait a moment for the plot to fully render
-        import time
-        time.sleep(0.5)
-        QApplication.processEvents()  # Final processing to ensure plot is drawn
-
-        # Create unique filename using just the subdirectory name
-        clean_subdir_name = re.sub(r'[\\/*?:"<>|]', '_', subdir_name)
-        filename = f"{clean_subdir_name}.png"
-        
-        # Save to the specified root directory
-        save_path = os.path.join(save_directory, filename)
-        print(f"Attempting to save to: {save_path}")
-
-        try:
-            # Ensure the canvas is fully drawn
-            self.plot_window.canvas.draw()
-            self.plot_window.canvas.flush_events()
-            QApplication.processEvents()
-            
-            # Check if figure has any content
-            if len(self.plot_window.canvas.figure.axes) == 0:
-                print(f"Warning: No axes found in figure for {subdir_name}")
-                return
-            
-            # Set figure size to 2032x1002 pixels at 100 DPI
-            self.plot_window.canvas.figure.set_size_inches(2032 / 100, 1002 / 100)
-            self._stamp_stats_on_figure(self.plot_window.canvas.figure)
-
-            # Ensure the save directory exists
-            os.makedirs(save_directory, exist_ok=True)
-            
-            # Save the figure
-            self.plot_window.canvas.figure.savefig(
-                save_path, dpi=100, bbox_inches="tight", facecolor="white"
-            )
-            
-            # Verify the file was created
-            if os.path.exists(save_path):
-                file_size = os.path.getsize(save_path)
-                print(f"Successfully exported: {save_path} (Size: {file_size} bytes)")
-            else:
-                print(f"Error: File was not created at {save_path}")
-                
-        except Exception as e:
-            print(f"Failed to save plot for {subdir_name}: {str(e)}")
-            import traceback
-            print(f"Full error: {traceback.format_exc()}")
-
-        # Close the plot window
-        self.plot_window.close()
 
     def export_plot(self):
         """Show the plot window, maximize it, save the plot as a .png file, and close the window."""
@@ -2269,17 +2129,7 @@ class MainWindow(QMainWindow):
             # For non-numeric values, maintain original values
             return series
 
-    def load_data_clicked(self):
-        try:
-            self.load_data()
-        except Exception as e:
-            print(e)
-            print('Error loading data')
-            return
-        print('Data Loaded')
-        QMessageBox.information(self, "Information", "Data Loaded")
-        
-    def parseDeviceFolder(self, path): 
+    def parseDeviceFolder(self, path):
         # If the path is a drive root (e.g., "D:\"), use the drive letter as the device folder
         if re.match(r'^[A-Za-z]:\\$', path):
 
@@ -2525,36 +2375,6 @@ class MainWindow(QMainWindow):
                             log_events['imu_temp_values'].append(float(temp_val))
             except Exception as e:
                 print(f"Error parsing temperature: {e}")
-
-    def load_data(self):
-        """Synchronous load (used by batch export and scripts). The GUI paths use
-        start_threaded_load, which runs the same parser on a worker thread."""
-        print('Loading data...')
-        device_path = self.label_folder.text()
-
-        # Use the helper function to find files with flexible naming
-        sensor_data_path = find_file_with_suffix(device_path, "Sensor_Data.csv")
-        log_data_path = find_file_with_suffix(device_path, "log.csv")
-        
-        if not sensor_data_path or not log_data_path:
-            missing_files = []
-            if not sensor_data_path:
-                missing_files.append("Sensor_Data.csv")
-            if not log_data_path:
-                missing_files.append("log.csv")
-                
-            QMessageBox.critical(self, "Error", f"Required files ({', '.join(missing_files)}) are missing.\n\nMake sure files ending with these names exist in the selected folder.")
-            return
-        
-        try:
-            result = self.parse_folder_data(device_path)
-            self.apply_parse_result(result, device_path)
-        except Exception as e:
-            print(f"Error during data loading: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            QMessageBox.critical(self, "Error", f"Error during data loading: {str(e)}")
-            return
 
     def parse_folder_data(self, device_path, progress_cb=None, cancel_event=None):
         """Parse Sensor_Data.csv and log.csv, each in a single pass.
