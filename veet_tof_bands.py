@@ -26,6 +26,17 @@ Corroboration is single-pass, not iterative: adjacency is evaluated against
 the stage-1 mask, so pruning one perimeter zone never cascades into pruning
 its neighbour. This keeps the operation deterministic and order-independent.
 
+Dual-return resolution (stage 0, optional)
+-------------------------------------------
+The TMF8828 reports up to two returns per zone. ``resolve_dual_return`` folds
+object 1 (primary) and object 2 (secondary) into a single (z, conf) pair
+*before* stage 1: object 1 is used whenever it passes the stage-1 gate;
+otherwise object 2 is consulted to confirm a confident-far reading, rescue a
+real target object 1 missed, or -- if object 2 is itself unusable -- mark the
+zone ambiguous and excluded. Callers without a second return simply skip this
+step and pass (z_mm, conf_raw) straight into ``valid_mask``/``analysis_mask``
+as before.
+
 Confidence semantics
 --------------------
 TMF8828 confidence is the SNR of the detected histogram peak, NOT a normalised
@@ -49,7 +60,7 @@ CONF_MAX = 255
 # Distance in mm at which the sensor's usable range begins. Returns below this
 # are physically impossible for a spectacle-mounted device and are dropped
 # regardless of reported confidence.
-Z_FLOOR_MM = 20.0
+Z_FLOOR_MM = 10.0
 
 # The sensor's minimum reporting distance: it cannot produce a genuine
 # time-of-flight return below this. A reading here -- including exactly 0 --
@@ -274,6 +285,70 @@ def valid_mask(z_mm: np.ndarray, conf_raw: np.ndarray) -> np.ndarray:
     return no_return | gated
 
 
+def resolve_dual_return(
+    z1_mm: np.ndarray,
+    conf1_raw: np.ndarray,
+    z2_mm: np.ndarray,
+    conf2_raw: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Resolve the TMF8828's two per-zone returns into one (z, conf) pair.
+
+    Object 1 (the primary/strongest return) is used whenever it passes the
+    normal validity gate. When it doesn't -- either a sub-floor/no-return
+    reading or a real-but-low-confidence one -- object 2 is consulted:
+
+    - object 2 sub-floor (no second target)  -> confident far (2000mm),
+      regardless of *why* object 1 failed. A low-confidence object-1 reading
+      is typically a phantom return from diffuse reflection off a nearby
+      surface, so it should not override a clean "nothing there" from
+      object 2.
+    - object 2 passes the validity gate        -> "rescued": object 2's
+      (z, conf) becomes the resolved measurement.
+    - object 2 is also nonzero-but-low-confidence -> ambiguous: neither
+      return can be trusted. Encoded as conf_resolved=0 paired with
+      z_resolved=z2 (always >= NO_RETURN_FLOOR_MM in this branch), which
+      guarantees the zone fails the existing ``valid_mask`` confidence
+      check without needing a separate exclusion mask threaded through
+      every downstream function. ``ambiguous_mask`` is returned purely so
+      callers can count these zones (see ``zone_yield``'s ambiguous_mask
+      parameter) -- it plays no role in gating.
+
+    Object 2 is gated by the same distance-dependent BANDS thresholds as
+    object 1 (same sensor, same characterization curve).
+
+    Parameters
+    ----------
+    z1_mm, conf1_raw, z2_mm, conf2_raw : arrays of identical shape.
+
+    Returns
+    -------
+    (z_resolved, conf_resolved, ambiguous_mask) -- z_resolved/conf_resolved
+    feed directly into ``valid_mask``/``analysis_mask`` exactly like a
+    single-return (z_mm, conf_raw) pair; ambiguous_mask is diagnostic only.
+    """
+    z1 = np.asarray(z1_mm, dtype=float)
+    c1 = np.asarray(conf1_raw, dtype=float)
+    z2 = np.asarray(z2_mm, dtype=float)
+    c2 = np.asarray(conf2_raw, dtype=float)
+    if not (z1.shape == c1.shape == z2.shape == c2.shape):
+        raise ValueError(
+            f"shape mismatch: z1 {z1.shape}, conf1 {c1.shape}, "
+            f"z2 {z2.shape}, conf2 {c2.shape}"
+        )
+
+    obj1_valid = (z1 >= NO_RETURN_FLOOR_MM) & (c1 >= min_confidence(z1))
+    obj2_zero = z2 < NO_RETURN_FLOOR_MM
+    obj2_valid = (z2 >= NO_RETURN_FLOOR_MM) & (c2 >= min_confidence(z2))
+    obj2_low = ~obj2_zero & ~obj2_valid
+    ambiguous = ~obj1_valid & obj2_low
+
+    z_resolved = np.where(obj1_valid, z1, np.where(obj2_zero, NO_RETURN_SENTINEL_MM, z2))
+    conf_resolved = np.where(
+        obj1_valid, c1, np.where(obj2_zero, float(CONF_MAX), np.where(obj2_low, 0.0, c2))
+    )
+    return z_resolved, conf_resolved, ambiguous
+
+
 def _neighbor_count(mask: np.ndarray, connectivity: int = 8) -> np.ndarray:
     """Count adjacent True zones for every cell of a (..., 8, 8) mask."""
     offsets = _OFFSETS_8 if connectivity == 8 else _OFFSETS_4
@@ -354,18 +429,29 @@ def zone_mask(
     return spatial_corroboration(gate, connectivity, require_interior_support)
 
 
-def zone_yield(z_mm: np.ndarray, conf_raw: np.ndarray, **kwargs) -> dict[str, float]:
+def zone_yield(
+    z_mm: np.ndarray,
+    conf_raw: np.ndarray,
+    ambiguous_mask: np.ndarray | None = None,
+    **kwargs,
+) -> dict[str, float]:
     """Diagnostic: what each validity stage costs, as fractions of all zones.
 
     ``perimeter_yield`` is the guard-band health indicator. A persistent drop
     relative to ``interior_yield`` is expected; a sharp change over time or
     across devices is a flag worth chasing.
+
+    ``ambiguous_mask``, if given (from ``resolve_dual_return``), adds
+    ``ambiguous_dual_return_fraction`` -- the share of analysis-field zones
+    excluded because neither TOF return could be trusted. Omitted entirely
+    for single-return callers, so this stat only appears for sessions with
+    dual-return data.
     """
     gate = valid_mask(z_mm, conf_raw)
     final = spatial_corroboration(gate, **kwargs)
     n = float(gate.size)
     n_perim = float(gate[..., PERIMETER].size)
-    return {
+    result = {
         "passed_confidence_gate": float(gate.sum()) / n,
         "analysis_field_yield": float((gate & ANALYSIS_FIELD).sum())
         / float(gate[..., ANALYSIS_FIELD].size),
@@ -374,6 +460,12 @@ def zone_yield(z_mm: np.ndarray, conf_raw: np.ndarray, **kwargs) -> dict[str, fl
         "interior_yield": float(final[..., INTERIOR].sum()) / float(gate[..., INTERIOR].size),
         "perimeter_yield": float(final[..., PERIMETER].sum()) / n_perim if n_perim else 0.0,
     }
+    if ambiguous_mask is not None:
+        am = np.asarray(ambiguous_mask, dtype=bool)
+        result["ambiguous_dual_return_fraction"] = float(am[..., ANALYSIS_FIELD].sum()) / float(
+            am[..., ANALYSIS_FIELD].size
+        )
+    return result
 
 
 def to_diopters(z_mm: np.ndarray, z_cap_mm: float = 2000.0) -> np.ndarray:

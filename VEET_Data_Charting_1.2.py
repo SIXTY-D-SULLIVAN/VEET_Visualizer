@@ -2710,33 +2710,6 @@ class MainWindow(QMainWindow):
         stats['tof'] = self.compute_tof_stats()
         return stats
 
-    def get_tof_arrays(self):
-        """TOF primary-return arrays reshaped for veet_tof_bands: (z_mm, conf_raw, times).
-
-        z_mm and conf_raw have shape (n_frames, 8, 8). Zones S0..S63 are mapped
-        row-major onto the 8x8 grid. Only the primary return (Dist1/Conf1) is
-        used. Returns None when the TOF table or its columns are unavailable.
-        """
-        tof = self.data.get('TOF')
-        if tof is None or tof.empty or 'time_stamp' not in tof.columns:
-            return None
-        if not pd.api.types.is_datetime64_any_dtype(tof['time_stamp']):
-            return None
-        dist_cols = [f"S{i}_Dist1" for i in range(64)]
-        conf_cols = [f"S{i}_Conf1" for i in range(64)]
-        if not all(col in tof.columns for col in dist_cols + conf_cols):
-            return None
-        df = tof[['time_stamp'] + dist_cols + conf_cols].dropna(subset=['time_stamp'])
-        df = df.sort_values('time_stamp').reset_index(drop=True)
-        if df.empty:
-            return None
-        try:
-            z_mm = df[dist_cols].to_numpy(dtype=float).reshape(-1, 8, 8)
-            conf_raw = df[conf_cols].to_numpy(dtype=float).reshape(-1, 8, 8)
-        except (TypeError, ValueError):
-            return None
-        return z_mm, conf_raw, df['time_stamp']
-
     def get_tof_arrays_full(self):
         """Both TOF returns reshaped to (n, 8, 8), for the array-file export.
 
@@ -2881,14 +2854,28 @@ class MainWindow(QMainWindow):
         passed (never the module's 5s default), wear detection is applied
         upstream (frames in confirmed not-worn windows are excluded from the
         worn-only series), and zone_yield diagnostics are logged per session.
+
+        When the session has a second TOF return (Dist2/Conf2), object 1 and
+        object 2 are folded into a single (z, conf) pair per zone via
+        veet_tof_bands.resolve_dual_return before gating -- see that
+        function's docstring for the resolution rules. Sessions without a
+        second return fall back to today's primary-only behavior unchanged.
         """
         tof_bands = _import_tof_bands()
         if tof_bands is None:
             return None
-        arrays = self.get_tof_arrays()
+        arrays = self.get_tof_arrays_full()
         if arrays is None:
             return None
-        z_mm, conf_raw, times = arrays
+        times = arrays['times']
+        z1_mm, conf1_raw = arrays['z1_mm'], arrays['conf1_raw']
+        z2_mm, conf2_raw = arrays['z2_mm'], arrays['conf2_raw']
+        if z2_mm is not None:
+            z_mm, conf_raw, ambiguous_mask = tof_bands.resolve_dual_return(
+                z1_mm, conf1_raw, z2_mm, conf2_raw)
+        else:
+            z_mm, conf_raw = z1_mm, conf1_raw
+            ambiguous_mask = None
 
         interval = self.get_configured_intervals().get('TOF')
         if not interval:
@@ -2936,9 +2923,12 @@ class MainWindow(QMainWindow):
             pct = count / diopters.size * 100.0 if diopters.size else 0.0
             band_share.append((band.name, range_text, pct, count * interval / 3600.0))
 
-        yields = tof_bands.zone_yield(z_mm, conf_raw)
-        print(f"TOF zone yield: analysis_field {yields['analysis_field_yield']:.3f}, "
-              f"perimeter {yields['perimeter_yield']:.3f}")
+        yields = tof_bands.zone_yield(z_mm, conf_raw, ambiguous_mask=ambiguous_mask)
+        yield_msg = (f"TOF zone yield: analysis_field {yields['analysis_field_yield']:.3f}, "
+                     f"perimeter {yields['perimeter_yield']:.3f}")
+        if 'ambiguous_dual_return_fraction' in yields:
+            yield_msg += f", ambiguous_dual_return {yields['ambiguous_dual_return_fraction']:.3f}"
+        print(yield_msg)
 
         return {
             'n_frames': n_frames,
@@ -3461,6 +3451,9 @@ class MainWindow(QMainWindow):
                              f"{tof['yields']['analysis_field_yield'] * 100:.1f}%"))
                 rows.append(("TOF (dioptric)", "Guard-band yield",
                              f"{tof['yields']['perimeter_yield'] * 100:.1f}%"))
+                if 'ambiguous_dual_return_fraction' in tof['yields']:
+                    rows.append(("TOF (dioptric)", "Ambiguous dual-return zones",
+                                 f"{tof['yields']['ambiguous_dual_return_fraction'] * 100:.1f}%"))
                 rows.append(("TOF (dioptric)", "Sample period", f"{tof['sample_period']:.1f} s"))
                 for name, range_text, pct, hours in tof['band_share']:
                     if pct >= 0.05:
