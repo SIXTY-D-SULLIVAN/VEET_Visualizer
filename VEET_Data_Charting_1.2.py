@@ -143,6 +143,44 @@ def _import_tof_bands():
             return None
 
 
+def tof_arrays_to_dataframe(arrays):
+    """Flatten TOF arrays into a row-per-frame CSV-friendly DataFrame."""
+    _ensure_core_modules()
+    if arrays is None:
+        return None
+
+    z1 = arrays.get('z1_mm')
+    conf1 = arrays.get('conf1_raw')
+    if z1 is None or conf1 is None:
+        return None
+
+    times = pd.to_datetime(arrays.get('times', []))
+    if isinstance(times, pd.Series):
+        time_values = times.tolist()
+    else:
+        time_values = list(times)
+
+    rows = []
+    n_frames = z1.shape[0]
+    for frame_idx in range(n_frames):
+        row = {'time_stamp': str(time_values[frame_idx]) if frame_idx < len(time_values) else ''}
+        for i in range(8):
+            for j in range(8):
+                row[f'z1_mm_{i}_{j}'] = float(z1[frame_idx, i, j])
+                row[f'conf1_raw_{i}_{j}'] = float(conf1[frame_idx, i, j])
+
+        z2 = arrays.get('z2_mm')
+        conf2 = arrays.get('conf2_raw')
+        if z2 is not None and conf2 is not None:
+            for i in range(8):
+                for j in range(8):
+                    row[f'z2_mm_{i}_{j}'] = float(z2[frame_idx, i, j])
+                    row[f'conf2_raw_{i}_{j}'] = float(conf2[frame_idx, i, j])
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 def find_file_with_suffix(directory, suffix):
     """Find a file in the specified directory that ends with the given suffix (case-insensitive)."""
     if not os.path.exists(directory):
@@ -1746,15 +1784,19 @@ class MainWindow(QMainWindow):
         self.btn_export_tof_arrays.clicked.connect(self.export_tof_arrays)
         action_layout.addWidget(self.btn_export_tof_arrays, 1, 0)
 
+        self.btn_export_tof_arrays_csv = QPushButton("Export TOF Arrays (.csv)", self)
+        self.btn_export_tof_arrays_csv.clicked.connect(self.export_tof_arrays_csv)
+        action_layout.addWidget(self.btn_export_tof_arrays_csv, 1, 1)
+
         self.btn_export_plot = QPushButton("Export Plot", self)
         self.btn_export_plot.clicked.connect(self.export_plot)
-        action_layout.addWidget(self.btn_export_plot, 1, 1)
+        action_layout.addWidget(self.btn_export_plot, 2, 0)
 
         self.stamp_stats_cb = QCheckBox("Stamp session statistics on exported PNGs", self)
         self.stamp_stats_cb.setChecked(self.settings.get('stamp_stats', False))
         self.stamp_stats_cb.stateChanged.connect(
             lambda state: self.settings.__setitem__('stamp_stats', state == 2))
-        action_layout.addWidget(self.stamp_stats_cb, 2, 0, 1, 2)
+        action_layout.addWidget(self.stamp_stats_cb, 3, 0, 1, 2)
 
         layout.addWidget(action_group)
         layout.addStretch(1)
@@ -2803,6 +2845,34 @@ class MainWindow(QMainWindow):
             import traceback
             traceback.print_exc()
             QMessageBox.critical(self, "Export Failed", f"Failed to write TOF array file: {e}")
+
+    def export_tof_arrays_csv(self):
+        """Export TOF arrays as a flat, human-readable CSV for inspection."""
+        arrays = self.get_tof_arrays_full()
+        if arrays is None:
+            QMessageBox.information(
+                self, "Export TOF Arrays CSV",
+                "No TOF data loaded.\n\nLoad a device folder with TOF data first.")
+            return
+
+        clean_name = re.sub(r'[\\/*?:"<>|]', '_', self.device_folder or "session")
+        default_path = os.path.join(self.label_folder.text() or "", f"{clean_name}_tof_arrays.csv")
+        path, _ = QFileDialog.getSaveFileName(self, "Export TOF Arrays CSV", default_path,
+                                              "CSV files (*.csv)")
+        if not path:
+            return
+
+        try:
+            df = tof_arrays_to_dataframe(arrays)
+            df.to_csv(path, index=False)
+            size_mb = os.path.getsize(path) / 1e6
+            print(f"TOF arrays exported to CSV {path} ({df.shape[0]:,} rows, {size_mb:.1f} MB)")
+            self.statusBar().showMessage(
+                f"TOF arrays exported to CSV: {df.shape[0]:,} rows -> {path}", 8000)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Export Failed", f"Failed to write TOF array CSV: {e}")
 
     def compute_tof_stats(self):
         """Dioptric TOF statistics via veet_tof_bands (validity gate + binning).
