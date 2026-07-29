@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-spec = importlib.util.spec_from_file_location('veet_charting', Path('VEET_Data_Charting_1.2.py'))
+spec = importlib.util.spec_from_file_location('veet_charting', Path('VEET_Data_Charting.py'))
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 

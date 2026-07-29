@@ -1,7 +1,7 @@
 """
-VEET Chart - Direct VEET Log Visualization Tool (v1.14)
+VEET Chart - Direct VEET Log Visualization Tool
 
-This script processes VEET CSV files (log.csv and Sensor_Data.csv) to generate interactive 
+This script processes VEET CSV files (log.csv and Sensor_Data.csv) to generate interactive
 visualizations of device data. It works with files that have various naming conventions as 
 long as they end with "log.csv" and "Sensor_Data.csv".
 
@@ -88,6 +88,8 @@ import threading
 from PySide6.QtCore import Qt, QCoreApplication, QThread, Signal, QTimer, QSettings, QDateTime
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, QLabel, QCheckBox, QFileDialog, QMainWindow, QComboBox, QMessageBox, QLineEdit, QProgressDialog, QDateTimeEdit, QSplashScreen, QDockWidget, QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox, QScrollArea
 from PySide6.QtGui import QClipboard, QPixmap, QColor
+
+__version__ = "1.2.0"
 
 # numpy/pandas/pytz and matplotlib are imported lazily so the GUI can show a
 # splash screen immediately at startup instead of blocking on library imports.
@@ -1537,6 +1539,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         _ensure_core_modules()
         super().__init__()
+        self.setWindowTitle(f"VEET Data Charting Tool — v{__version__}")
 
         # Define all attributes BEFORE calling initUI()
         self.plot_labels = {

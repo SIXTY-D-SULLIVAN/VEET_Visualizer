@@ -1,4 +1,4 @@
-# VEET Data Charting Tool v1.14
+# VEET Data Charting Tool v1.2.0
 
 A comprehensive interactive visualization tool for VEET (Wearable Environmental Exposure Tracker) device data analysis. This Python application processes the CSV data files from the device and generates detailed, interactive plots for comprehensive sensor data analysis.
 

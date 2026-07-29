@@ -7,7 +7,7 @@ import pandas as pd
 
 spec = importlib.util.spec_from_file_location(
     "veet_charting",
-    Path(__file__).resolve().parents[1] / "VEET_Data_Charting_1.2.py",
+    Path(__file__).resolve().parents[1] / "VEET_Data_Charting.py",
 )
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
