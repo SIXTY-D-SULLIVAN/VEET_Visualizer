@@ -86,7 +86,7 @@ import csv
 import json
 import threading
 from PySide6.QtCore import Qt, QCoreApplication, QThread, Signal, QTimer, QSettings, QDateTime
-from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, QLabel, QCheckBox, QFileDialog, QMainWindow, QComboBox, QMessageBox, QLineEdit, QProgressDialog, QDateTimeEdit, QSplashScreen, QDockWidget, QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox, QScrollArea
+from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, QLabel, QCheckBox, QFileDialog, QMainWindow, QComboBox, QMessageBox, QLineEdit, QProgressDialog, QDateTimeEdit, QSplashScreen, QDockWidget, QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox, QScrollArea, QTabWidget
 from PySide6.QtGui import QClipboard, QPixmap, QColor
 
 __version__ = "1.2.0"
@@ -1428,24 +1428,118 @@ class TOFAnalysisWindow(QMainWindow):
     Renders from a precomputed tof-stats dict (see MainWindow.compute_tof_stats)
     so the window itself carries no gating logic — veet_tof_bands stays the
     single source of truth.
+
+    ``recompute_callback``, if given, is called with no arguments to get a
+    fresh tof-stats dict after a confidence-threshold reload (lab
+    characterisation workflow) -- see reload_thresholds().
     """
 
-    def __init__(self, tof_stats, device_folder):
+    def __init__(self, tof_stats, device_folder, recompute_callback=None):
         _ensure_core_modules()
         _ensure_matplotlib()
         super().__init__()
+        self.device_folder = device_folder
+        self.recompute_callback = recompute_callback
         self.setWindowTitle(f"TOF Dioptric Analysis - {device_folder}")
+
+        outer_layout = QVBoxLayout()
+
+        controls = QHBoxLayout()
+        btn_reload = QPushButton("Reload Confidence Thresholds")
+        btn_reload.setToolTip(
+            "Re-read veet_tof_confidence_thresholds.json after a lab-characterisation "
+            "edit and re-analyze this session -- no restart needed.")
+        btn_reload.clicked.connect(self.reload_thresholds)
+        btn_reload.setEnabled(recompute_callback is not None)
+        self.threshold_status_label = QLabel("")
+        controls.addWidget(btn_reload)
+        controls.addWidget(self.threshold_status_label, 1)
+        outer_layout.addLayout(controls)
+
+        self.tabs = QTabWidget()
+
+        analysis_tab = QWidget()
+        analysis_layout = QVBoxLayout()
         self.canvas = FigureCanvas(Figure(figsize=(13, 6)))
         self.toolbar = NavigationToolbar(self.canvas, self)
+        analysis_layout.addWidget(self.toolbar)
+        analysis_layout.addWidget(self.canvas)
+        analysis_tab.setLayout(analysis_layout)
+        self.tabs.addTab(analysis_tab, "Analysis")
 
-        layout = QVBoxLayout()
-        layout.addWidget(self.toolbar)
-        layout.addWidget(self.canvas)
+        self.thresholds_table = QTableWidget()
+        self.thresholds_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.tabs.addTab(self.thresholds_table, "Confidence Thresholds")
+
+        outer_layout.addWidget(self.tabs)
         central_widget = QWidget()
-        central_widget.setLayout(layout)
+        central_widget.setLayout(outer_layout)
         self.setCentralWidget(central_widget)
 
+        self._update_threshold_status()
+        self._refresh_thresholds_table()
         self.plot(tof_stats, device_folder)
+
+    def _update_threshold_status(self, reloaded=False):
+        """Legend/status line so it's visible at a glance whether a reload
+        actually picked anything up -- not just a silent no-op."""
+        import datetime
+        tof_bands = _import_tof_bands()
+        if tof_bands is None:
+            self.threshold_status_label.setText("veet_tof_bands.py not found -- thresholds unknown.")
+            return
+        loaded = getattr(tof_bands, 'CONFIDENCE_THRESHOLDS_LOADED_FROM_FILE', False)
+        source = getattr(tof_bands, 'CONFIDENCE_THRESHOLDS_SOURCE', '?')
+        origin = "file" if loaded else "built-in defaults (file not found)"
+        prefix = "Reloaded" if reloaded else "Loaded"
+        when = datetime.datetime.now().strftime('%H:%M:%S')
+        self.threshold_status_label.setText(
+            f"{prefix} {when} — confidence thresholds: {origin} — {source}")
+
+    def _refresh_thresholds_table(self):
+        """Legend tab: the actual gate values currently in effect, per band."""
+        tof_bands = _import_tof_bands()
+        table = self.thresholds_table
+        headers = ["Band", "Name", "Distance (mm)", "Vergence (D)", "Min raw (SNR)"]
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        if tof_bands is None:
+            table.setRowCount(0)
+            return
+        bands = tof_bands.BANDS
+        table.setRowCount(len(bands))
+        for row, b in enumerate(bands):
+            z_hi = 'inf' if b.z_max_mm == float('inf') else f"{b.z_max_mm:.0f}"
+            d_hi = 'inf' if b.d_max == float('inf') else f"{b.d_max:.2f}"
+            values = [
+                str(b.index), b.name, f"{b.z_min_mm:.0f}-{z_hi}",
+                f"{d_hi}-{b.d_min:.2f}", str(b.conf_raw),
+            ]
+            for col, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if 1 <= b.index <= 3:  # near-work bands, matches the bar-chart highlight
+                    item.setBackground(QColor(255, 228, 225))
+                table.setItem(row, col, item)
+        table.resizeColumnsToContents()
+        table.horizontalHeader().setStretchLastSection(True)
+
+    def reload_thresholds(self):
+        tof_bands = _import_tof_bands()
+        if tof_bands is None or self.recompute_callback is None:
+            return
+        try:
+            tof_bands.reload_confidence_thresholds()
+        except ValueError as e:
+            QMessageBox.critical(self, "Reload Failed", str(e))
+            return
+        self._update_threshold_status(reloaded=True)
+        self._refresh_thresholds_table()
+        new_stats = self.recompute_callback()
+        if new_stats:
+            self.plot(new_stats, self.device_folder)
+        self.statusBar().showMessage(
+            "Confidence thresholds reloaded and TOF analysis refreshed.", 6000)
 
     def plot(self, s, device_folder):
         fig = self.canvas.figure
@@ -3572,8 +3666,18 @@ class MainWindow(QMainWindow):
                 "No TOF dioptric statistics available.\n\nLoad a device folder with "
                 "TOF data first, and make sure veet_tof_bands.py is next to this script.")
             return
-        self.tof_window = TOFAnalysisWindow(tof_stats, self.device_folder)
+        self.tof_window = TOFAnalysisWindow(
+            tof_stats, self.device_folder, recompute_callback=self.recompute_tof_stats)
         self.tof_window.show()
+
+    def recompute_tof_stats(self):
+        """Re-run compute_tof_stats (e.g. after a confidence-threshold reload,
+        see TOFAnalysisWindow.reload_thresholds) and cache the fresh result
+        the same way parse_folder_data's initial pass does."""
+        stats = self.compute_tof_stats()
+        if self.session_stats is not None:
+            self.session_stats['tof'] = stats
+        return stats
 
     def update_selected_plots(self):
          self.selected_plots = [cb.text() for cb in self.checkboxes if cb.isChecked()]

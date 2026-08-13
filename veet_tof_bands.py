@@ -9,7 +9,7 @@ as thresholds are refined.
 
 Sensor context
 --------------
-TOF: 8x8 zone grid, 41 deg x 52 deg FOV, usable range ~20-2000+ mm.
+TOF: 8x8 zone grid, 41 deg x 52 deg FOV, usable range ~10-2000+ mm.
 Confidence is reported per zone as an unsigned byte, 0-255, where 255 == 100%.
 
 Two-stage validity
@@ -26,16 +26,14 @@ Corroboration is single-pass, not iterative: adjacency is evaluated against
 the stage-1 mask, so pruning one perimeter zone never cascades into pruning
 its neighbour. This keeps the operation deterministic and order-independent.
 
-Dual-return resolution (stage 0, optional)
--------------------------------------------
-The TMF8828 reports up to two returns per zone. ``resolve_dual_return`` folds
-object 1 (primary) and object 2 (secondary) into a single (z, conf) pair
-*before* stage 1: object 1 is used whenever it passes the stage-1 gate;
-otherwise object 2 is consulted to confirm a confident-far reading, rescue a
-real target object 1 missed, or -- if object 2 is itself unusable -- mark the
-zone ambiguous and excluded. Callers without a second return simply skip this
-step and pass (z_mm, conf_raw) straight into ``valid_mask``/``analysis_mask``
-as before.
+Dual-return resolution (stage 0, mandatory)
+--------------------------------------------
+The TMF8828 always reports two returns per zone; VEET2 exposes no
+object-1-only mode. ``resolve_dual_return`` folds object 1 (primary) and
+object 2 (secondary) into a single (z, conf) pair *before* stage 1: object 1
+is used whenever it passes the stage-1 gate; otherwise object 2 is consulted
+to confirm a confident-far reading, rescue a real target object 1 missed, or
+-- if object 2 is itself unusable -- mark the zone ambiguous and excluded.
 
 Confidence semantics
 --------------------
@@ -43,15 +41,20 @@ TMF8828 confidence is the SNR of the detected histogram peak, NOT a normalised
 percentage. Thresholds are raw register values and are only valid for the
 encoding they were characterised under -- see CONFIDENCE_ENCODING.
 
-Provenance: thresholds below are from a preliminary bench characterisation
+Provenance: default thresholds are from a preliminary bench characterisation
 and should be re-derived against a reference target set before being used
-for any published analysis.
+for any published analysis. Thresholds are loaded from
+``CONFIDENCE_THRESHOLDS_PATH`` (a JSON file alongside this module) when
+present, so lab characterisation can update them without touching code --
+see ``reload_confidence_thresholds`` and VEET_TOF_INTEGRATION.md.
 """
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -224,28 +227,127 @@ class Band:
         return 0.0 if math.isinf(self.z_max_mm) else 1000.0 / self.z_max_mm
 
 
-_SPEC = [
-    # index, name,                z_min,  z_max,  min_raw, anchor
-    (0, "artifact_occlusion",        0.0,   100.0, 243, "sub-100 mm, treat as occlusion"),
-    (1, "extreme_near",            100.0,   200.0, 230, "IMI <20 cm risk threshold"),
-    (2, "close_near",              200.0,   300.0, 205, "Sydney Myopia Study; Gajjar 2022"),
-    (3, "standard_near",           300.0,   400.0, 154, "clinical near reference 33/40 cm"),
-    (4, "near_intermediate",       400.0,   600.0, 103, "upper edge of Ostrin near band"),
-    (5, "intermediate",            600.0,  1000.0,  77, "Ostrin intermediate band"),
-    (6, "room",                   1000.0,  2000.0,  64, "-"),
-    (7, "far",                    2000.0, math.inf,  52, "effective optical infinity"),
+# Band geometry (edges, names, literature anchors) is NOT lab-tunable -- it's
+# coupled to the dioptric histogram (Invariant: one band table, two uses).
+# Only the confidence thresholds (min_raw) are expected to change as lab
+# characterisation proceeds; those are loaded separately, below.
+_BAND_STRUCTURE = [
+    # index, name,                z_min,  z_max,  anchor
+    (0, "artifact_occlusion",        0.0,   100.0, "sub-100 mm, treat as occlusion"),
+    (1, "extreme_near",            100.0,   200.0, "IMI <20 cm risk threshold"),
+    (2, "close_near",              200.0,   300.0, "Sydney Myopia Study; Gajjar 2022"),
+    (3, "standard_near",           300.0,   400.0, "clinical near reference 33/40 cm"),
+    (4, "near_intermediate",       400.0,   600.0, "upper edge of Ostrin near band"),
+    (5, "intermediate",            600.0,  1000.0, "Ostrin intermediate band"),
+    (6, "room",                   1000.0,  2000.0, "-"),
+    (7, "far",                    2000.0, math.inf, "effective optical infinity"),
 ]
 
-BANDS: tuple[Band, ...] = tuple(
-    Band(i, name, zlo, zhi, raw, anchor)
-    for i, name, zlo, zhi, raw, anchor in _SPEC
-)
+# Preliminary bench-characterisation values -- used for any band the config
+# file doesn't cover, and when the file is absent entirely (e.g. fresh clone).
+_DEFAULT_MIN_RAW_BY_NAME = {
+    "artifact_occlusion": 243,
+    "extreme_near": 230,
+    "close_near": 205,
+    "standard_near": 154,
+    "near_intermediate": 103,
+    "intermediate": 77,
+    "room": 64,
+    "far": 52,
+}
 
-# Upper edges used for vectorised lookup. searchsorted(..., side="right")
-# places a sample exactly on an edge into the FARTHER band, matching the
-# "100-200 mm" convention where 100 mm belongs to band 1.
-_EDGES = np.array([b.z_max_mm for b in BANDS[:-1]], dtype=float)
-_MIN_RAW = np.array([b.conf_raw for b in BANDS], dtype=np.int16)
+# Lab validation edits this file in place -- see reload_confidence_thresholds()
+# and VEET_TOF_INTEGRATION.md §2/Provenance. Not committed-and-forget: this is
+# the expected edit surface as characterisation progresses.
+CONFIDENCE_THRESHOLDS_PATH = Path(__file__).with_name("veet_tof_confidence_thresholds.json")
+
+# Set by _load_min_raw_by_name() below; introspectable by calling tools so a
+# GUI can show whether it's showing lab-calibrated or fallback thresholds.
+CONFIDENCE_THRESHOLDS_SOURCE: str = ""
+CONFIDENCE_THRESHOLDS_LOADED_FROM_FILE: bool = False
+
+
+def _load_min_raw_by_name(path: "str | Path | None" = None) -> dict[str, int]:
+    """Per-band min-raw confidence thresholds: config file values override
+    the preliminary bench-characterisation defaults; unlisted bands fall
+    back to their default. Raises ValueError on a malformed config -- a bad
+    threshold should fail loudly, not gate silently on garbage.
+    """
+    global CONFIDENCE_THRESHOLDS_SOURCE, CONFIDENCE_THRESHOLDS_LOADED_FROM_FILE
+    target = Path(path) if path is not None else CONFIDENCE_THRESHOLDS_PATH
+    values = dict(_DEFAULT_MIN_RAW_BY_NAME)
+
+    if not target.exists():
+        CONFIDENCE_THRESHOLDS_SOURCE = f"{target} (not found; using built-in defaults)"
+        CONFIDENCE_THRESHOLDS_LOADED_FROM_FILE = False
+        return values
+
+    with open(target, "r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse confidence-threshold config {target}: {e}") from e
+
+    raw_map = data.get("min_raw_by_band", data) if isinstance(data, dict) else None
+    if not isinstance(raw_map, dict):
+        raise ValueError(
+            f"{target} must be a JSON object, optionally with a "
+            f"'min_raw_by_band' key mapping band names to integers."
+        )
+
+    unknown = set(raw_map) - set(_DEFAULT_MIN_RAW_BY_NAME)
+    if unknown:
+        raise ValueError(
+            f"Unknown band name(s) in {target}: {sorted(unknown)}. "
+            f"Expected a subset of {sorted(_DEFAULT_MIN_RAW_BY_NAME)}."
+        )
+    for name, value in raw_map.items():
+        if isinstance(value, bool) or not isinstance(value, int) or not (0 <= value <= CONF_MAX):
+            raise ValueError(
+                f"Bad threshold for band '{name}' in {target}: {value!r} "
+                f"(must be an integer 0-{CONF_MAX})"
+            )
+        values[name] = value
+
+    CONFIDENCE_THRESHOLDS_SOURCE = str(target)
+    CONFIDENCE_THRESHOLDS_LOADED_FROM_FILE = True
+    return values
+
+
+def _build_bands(min_raw_by_name: dict[str, int]):
+    bands = tuple(
+        Band(index, name, zlo, zhi, min_raw_by_name[name], anchor)
+        for index, name, zlo, zhi, anchor in _BAND_STRUCTURE
+    )
+    # Upper edges used for vectorised lookup. searchsorted(..., side="right")
+    # places a sample exactly on an edge into the FARTHER band, matching the
+    # "100-200 mm" convention where 100 mm belongs to band 1.
+    edges = np.array([b.z_max_mm for b in bands[:-1]], dtype=float)
+    min_raw = np.array([b.conf_raw for b in bands], dtype=np.int16)
+    return bands, edges, min_raw
+
+
+BANDS: tuple[Band, ...]
+_EDGES: np.ndarray
+_MIN_RAW: np.ndarray
+BANDS, _EDGES, _MIN_RAW = _build_bands(_load_min_raw_by_name())
+
+
+def reload_confidence_thresholds(path: "str | Path | None" = None) -> tuple[Band, ...]:
+    """Re-read the confidence-threshold config and rebuild BANDS/_EDGES/_MIN_RAW
+    in place, without restarting the process -- the expected workflow while
+    lab characterisation is ongoing: edit CONFIDENCE_THRESHOLDS_PATH, then
+    call this.
+
+    All gating functions (``valid_mask``, ``band_index``, ``min_confidence``,
+    ...) read the module-level ``_EDGES``/``_MIN_RAW`` globals at call time,
+    so they pick up the reload automatically. The one exception: a caller
+    that did ``from veet_tof_bands import BANDS`` earlier keeps its own
+    stale reference -- re-fetch via the module (``tb.BANDS``) after reloading.
+    """
+    global BANDS, _EDGES, _MIN_RAW
+    BANDS, _EDGES, _MIN_RAW = _build_bands(_load_min_raw_by_name(path))
+    return BANDS
 
 
 def band_index(z_mm: np.ndarray) -> np.ndarray:
@@ -525,6 +627,7 @@ def dioptric_dose(
 
 
 if __name__ == "__main__":
+    print(f"Confidence thresholds: {CONFIDENCE_THRESHOLDS_SOURCE}")
     hdr = f"{'idx':>3}  {'band':<20} {'mm range':>15} {'D range':>15} {'min raw':>8}"
     print(hdr)
     print("-" * len(hdr))

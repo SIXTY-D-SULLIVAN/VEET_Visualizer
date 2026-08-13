@@ -1,0 +1,15 @@
+{
+  "_readme": "Per-band minimum raw confidence (SNR domain, linear encoding, 0-255) for the veet_tof_bands.py validity gate. Edit the values below after lab characterisation -- veet_tof_bands.py reads this file at import time, and VEET_TOF_Viewer.py can reload it mid-session without restarting (see reload_confidence_thresholds() in veet_tof_bands.py). Band geometry (mm ranges) is NOT here -- only confidence thresholds are lab-tunable; see VEET_TOF_INTEGRATION.md section 3.2.",
+  "provenance": "preliminary bench characterisation, pre-validation -- see VEET_TOF_INTEGRATION.md Provenance",
+  "last_updated": "2026-08-12",
+  "min_raw_by_band": {
+    "artifact_occlusion": 243,
+    "extreme_near": 230,
+    "close_near": 205,
+    "standard_near": 154,
+    "near_intermediate": 103,
+    "intermediate": 77,
+    "room": 64,
+    "far": 20
+  }
+}
