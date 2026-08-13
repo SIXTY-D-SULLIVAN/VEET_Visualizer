@@ -6,8 +6,6 @@ This module is the **single source of truth** for two coupled things: which time
 
 Status: pre-validation. Thresholds are provisional (see [Provenance](#provenance)).
 
-> **Blocking item.** `CONFIDENCE_ENCODING` is currently `"unknown"`. Confirm the `logarithmic_confidence` register bit in the deployed firmware before trusting any gated output. See §3.2.
-
 ---
 
 ## 1. Scope
@@ -20,7 +18,7 @@ Status: pre-validation. Thresholds are provisional (see [Provenance](#provenance
 
 ## 2. Sensor and data contract
 
-VEET 2 TOF is an 8×8 zone depth array, nominal FOV 41° × 52°, usable range roughly 20–2000+ mm. Nominal sampling is 0.2 Hz (one sample per 5 s), giving ~10,080 samples over a 14-hour pediatric wear day.
+VEET 2 TOF is an 8×8 zone depth array, nominal FOV 41° × 52°, usable range roughly 10–2000+ mm. Sampling rate is configuration-dependent and is recorded in the INF line of `sensor_data.csv` — read it from there rather than assuming a fixed rate. Nominal sampling for VEET2 is 0.5 Hz (one sample per 2 s).
 
 Every function takes two parallel arrays:
 
@@ -33,15 +31,15 @@ Leading dimensions are free — pass `(8, 8)` for one frame or `(n_samples, 8, 8
 
 **Do not pre-convert confidence to a percentage.** Thresholds are stored as raw integers and compared directly.
 
-**Do not pre-filter invalid returns to NaN or 0 before calling.** The gate handles them. Zeros and sub-20 mm values are dropped by `Z_FLOOR_MM`; non-finite values are dropped by `valid_mask`.
+**Do not pre-filter invalid returns to NaN or 0 before calling.** The gate handles them. Zeros and sub-10 mm values are dropped by `Z_FLOOR_MM`; non-finite values are dropped by `valid_mask`.
 
 ---
 
 ## 3. Validity model
 
-### 3.1 Dual-return resolution (stage 0, optional)
+### 3.1 Dual-return resolution (stage 0, mandatory)
 
-The TMF8828 reports up to two returns per zone: object 1 (primary/strongest) and object 2 (secondary). `resolve_dual_return(z1, c1, z2, c2)` folds both into the single `(z, conf)` pair that stage 1 expects. Sessions without a second return (older logs, or hardware/firmware without Dist2/Conf2) skip this step entirely and pass `(z_mm, conf_raw)` straight to `valid_mask` as before — nothing here is required.
+The TMF8828 always reports two returns per zone: object 1 (primary/strongest) and object 2 (secondary). VEET2 exposes no configuration that collects object 1 only. `resolve_dual_return(z1, c1, z2, c2)` folds both into the single `(z, conf)` pair that stage 1 expects, and must run upstream of `valid_mask`/`analysis_mask` for every session.
 
 Resolution, per zone per frame:
 
@@ -59,33 +57,30 @@ Object 2 is gated by the same distance-dependent thresholds as object 1 (§3.2 t
 
 **Real-data outcome shares** (same session, 402,368 zone-frames): object-1-valid 16.0%, confident-far 72.3%, rescued-by-object-2 1.9%, ambiguous 9.8%. The ambiguous share is a real, non-trivial signal worth trending via `ambiguous_dual_return_fraction`, not a bug. Rescues come almost entirely from the "object 1 nonzero-but-low-confidence" bucket rather than "object 1 exactly 0" (0% of sub-floor object-1 zones were rescued in this session) — consistent with the sensor reporting its strongest return as object 1.
 
-**Yield comparability caveat.** Once dual-return resolution is active, `zone_yield()`'s existing fractions (`analysis_field_yield`, `perimeter_yield`, etc.) reflect the *resolved* array, which includes object-2 rescues. They are not directly comparable to yields from an older primary-only session on the same hardware — a shift across the dual-return cutover is a metric-definition change, not a hardware change.
+**Yield comparability caveat.** `zone_yield()`'s fractions (`analysis_field_yield`, `perimeter_yield`, etc.) reflect the *resolved* array, which includes object-2 rescues. They are not directly comparable to yields from an older primary-only log predating dual-return export — a shift across that cutover is a metric-definition change, not a hardware change.
 
 ### 3.2 Confidence gate (stage 1)
 
 **Confidence is SNR, not a percentage.** Per TMF882X datasheet §7.4.7, the reported byte is the signal-to-noise ratio of the detected histogram peak. A value of 255 does not mean "100% confident." Earlier revisions of this module described the thresholds as percentages; that was a misreading and has been removed.
 
-Two encodings exist, selected by the `logarithmic_confidence` register bit:
-
-- **Linear (bit = 0):** the raw value *is* the SNR, clipped at 255.
-- **Logarithmic (bit = 1):** raw 0–40 is SNR directly; above 40, `SNR = 40 × 1.053676^(raw − 40)`.
+VEET2 firmware is fixed to linear confidence encoding (`logarithmic_confidence = 0`, confirmed against deployed firmware); the TMF8828's logarithmic mode exists in silicon but is not exposed on this hardware. Under linear encoding the raw byte *is* the SNR, clipped at 255.
 
 Confidence required scales with measured distance — weak far returns are cheap and common, weak near returns are suspicious:
 
-| Band | Name | Distance (mm) | Vergence (D) | Min raw | SNR if linear | SNR if logarithmic |
-|---|---|---|---|---|---|---|
-| 0 | `artifact_occlusion` | < 100 | > 10.0 | 243 | 243 | 1,627,792 |
-| 1 | `extreme_near` | 100–200 | 10.00–5.00 | 230 | 230 | 824,910 |
-| 2 | `close_near` | 200–300 | 5.00–3.33 | 205 | 205 | 223,218 |
-| 3 | `standard_near` | 300–400 | 3.33–2.50 | 154 | 154 | 15,512 |
-| 4 | `near_intermediate` | 400–600 | 2.50–1.67 | 103 | 103 | 1,078 |
-| 5 | `intermediate` | 600–1000 | 1.67–1.00 | 77 | 77 | 277 |
-| 6 | `room` | 1000–2000 | 1.00–0.50 | 64 | 64 | 140 |
-| 7 | `far` | > 2000 | < 0.50 | 52 | 52 | 75 |
+| Band | Name | Distance (mm) | Vergence (D) | Min raw (SNR) |
+|---|---|---|---|---|
+| 0 | `artifact_occlusion` | < 100 | > 10.0 | 243 |
+| 1 | `extreme_near` | 100–200 | 10.00–5.00 | 230 |
+| 2 | `close_near` | 200–300 | 5.00–3.33 | 205 |
+| 3 | `standard_near` | 300–400 | 3.33–2.50 | 154 |
+| 4 | `near_intermediate` | 400–600 | 2.50–1.67 | 103 |
+| 5 | `intermediate` | 600–1000 | 1.67–1.00 | 77 |
+| 6 | `room` | 1000–2000 | 1.00–0.50 | 64 |
+| 7 | `far` | > 2000 | < 0.50 | 52 |
 
-**The thresholds are silently coupled to the register bit.** The gate spans 4.7× under linear encoding and 21,730× under logarithmic. A mismatch between characterisation firmware and deployed firmware breaks every threshold with no error raised. Record the encoding in session metadata and assert it at load time.
+The table above shows the shipped defaults. **These are lab-editable, not hardcoded.** `min_raw` per band loads from `veet_tof_confidence_thresholds.json` (alongside `veet_tof_bands.py`) at import time; band geometry (the mm/vergence columns) does not live there and is not lab-tunable, since it's coupled to the dioptric histogram (Invariant §6.1). Edit the JSON's `min_raw_by_band` map after each characterisation pass — you only need to list the bands that changed, anything omitted keeps its built-in default. Call `veet_tof_bands.reload_confidence_thresholds()` to pick up an edit without restarting a running session — both `VEET_TOF_Viewer.py` and `VEET_Data_Charting.py`'s TOF Analysis window expose this as a "Reload Confidence Thresholds" button, re-analyze the loaded session, and confirm explicitly (status bar message + a "Confidence Thresholds" legend tab showing what's now loaded) — a reload is never silent. A bad value (wrong type, out of 0–255, or an unrecognised band name) raises immediately rather than gating silently on garbage. `CONFIDENCE_THRESHOLDS_SOURCE` reports which file (or "not found; using built-in defaults") is currently in effect.
 
-The gate compares raw values directly, so decoding is never needed on the hot path. `confidence_to_snr()` exists for diagnostics and raises if the encoding is `"unknown"`.
+The gate compares raw values directly, so decoding is never needed on the hot path. `confidence_to_snr()` exists for diagnostics.
 
 Band edges are inclusive-low, exclusive-high: a reading of exactly 100 mm belongs to band 1.
 
@@ -145,7 +140,7 @@ from veet_tof_bands import (
     analysis_mask, to_diopters,
     dioptric_histogram, dioptric_dose,
     zone_mask, spatial_corroboration, zone_yield, field_coverage_mm,
-    resolve_dual_return,
+    resolve_dual_return, reload_confidence_thresholds,
 )
 ```
 
@@ -153,7 +148,8 @@ from veet_tof_bands import (
 |---|---|---|
 | `analysis_mask(z, c)` | bool `(...,8,8)` | **Primary.** Gate ∩ analysis field. All reporting derives from this. |
 | `valid_mask(z, c)` | bool `(...,8,8)` | Stage 1 only. Use when you need the gate independent of the field. |
-| `resolve_dual_return(z1, c1, z2, c2)` | `(z, conf, ambiguous)` | **Stage 0, optional.** Folds object 1/object 2 into one `(z, conf)` pair; feed the result into `valid_mask`/`analysis_mask` exactly like a single-return pair. See §3.1. |
+| `reload_confidence_thresholds(path=None)` | `BANDS` | Re-read `CONFIDENCE_THRESHOLDS_PATH` (or `path`) and rebuild `BANDS`/the gate in place — the lab-characterisation edit loop. See §3.2. |
+| `resolve_dual_return(z1, c1, z2, c2)` | `(z, conf, ambiguous)` | **Stage 0, mandatory.** Folds object 1/object 2 into one `(z, conf)` pair; feed the result into `valid_mask`/`analysis_mask` exactly like a single-return pair. See §3.1. |
 | `to_diopters(z)` | float, same shape | Vergence, far tail clamped. |
 | `dioptric_histogram(z, c, dt)` | float `(41,)` | Time-weighted, seconds per bin. Last element is overflow. |
 | `dioptric_dose(z, c, dt)` | float | Dioptre-hours. The distance analogue of lux-hours. |
@@ -172,30 +168,29 @@ from veet_tof_bands import (
 
 Changing any of these silently invalidates comparisons against prior runs. Bump a version constant and re-run the full pipeline if you touch them.
 
-1. Band edges in `_SPEC` and dioptric bin edges must stay coupled. One band table, two uses.
-2. `CONFIDENCE_ENCODING` must match the firmware that produced the data. Assert it at load; never infer it from the data.
-2. `analysis_mask` is the only path to reported measures — true even for dual-return sessions. `resolve_dual_return` runs strictly upstream of stage 1; ambiguous zones are excluded via `conf_resolved = 0`, which stage 1 already rejects, not via a separate mask threaded through the pipeline.
+1. Band edges (mm/vergence geometry) and dioptric bin edges must stay coupled — one band table, two uses. Unlike the confidence thresholds (§3.2), band geometry is not exposed for lab editing.
+2. `CONFIDENCE_ENCODING` is fixed at `"linear"` — VEET2 firmware does not expose the logarithmic option, so no per-session assertion is needed.
+2. `analysis_mask` is the only path to reported measures. `resolve_dual_return` runs strictly upstream of stage 1 for every session; ambiguous zones are excluded via `conf_resolved = 0`, which stage 1 already rejects, not via a separate mask threaded through the pipeline.
 3. `spatial_corroboration` is single-pass. Adjacency is evaluated against the stage-1 mask, so pruning a zone never cascades into pruning its neighbour. Iterative erosion would be order-dependent — do not "improve" it into a loop.
 4. `D_BIN_WIDTH = 0.25` is justified by depth of focus, not convenience.
-5. `Z_FLOOR_MM = 20.0` is the sensor's physical near limit.
+5. `Z_FLOOR_MM = 10.0` is the sensor's physical near limit.
 6. Retain all 64 zones in storage regardless of what is analyzed. The guard band costs nothing to log and cannot be recovered retroactively.
 
 ---
 
 ## 7. Integration checklist
 
-- [ ] **Confirm the `logarithmic_confidence` register bit and set `CONFIDENCE_ENCODING`. Blocking.**
-- [ ] Assert the encoding matches between characterisation and deployment firmware.
-- [ ] Confirm `sample_period_s` from session metadata rather than defaulting.
+- [ ] Confirm `sample_period_s` from session metadata (the INF line) rather than defaulting.
 - [ ] Account for 8×8 sub-capture timing: the frame is assembled from four interleaved sub-captures over a 66 ms (125 k iterations) to 258 ms (550 k) ranging period, so zones within one frame are not simultaneous. Head motion during the burst is a spatial artefact source for any cross-zone metric.
 - [ ] Never index coverage tuples positionally without checking the order — they are `(vertical, horizontal)`, and the field being taller than wide makes a transposition look plausible.
 - [ ] Condition any `scene_dioptric_range` reporting on working distance; below ~350 mm the analysis field is narrower than a page (§3.4).
 - [ ] Apply wear-detection upstream. Non-wear periods will otherwise register as valid near returns from whatever surface the device is resting on — band 0 exists partly to catch this, but it is not a wear detector.
 - [ ] Log `zone_yield()` per session. Track `analysis_field_yield` and `perimeter_yield` over time and across devices; a sharp change is a hardware or mounting flag.
-- [ ] For dual-return sessions, also track `ambiguous_dual_return_fraction` (expect ~10% based on one real session, §3.1); a sharp change flags the same kind of hardware/mounting issue as the other yields. Remember it isn't comparable to yields from primary-only sessions (§3.1).
+- [ ] Also track `ambiguous_dual_return_fraction` (expect ~10% based on one real session, §3.1); a sharp change flags the same kind of hardware/mounting issue as the other yields. Remember it isn't comparable to yields from older primary-only logs predating dual-return export (§3.1).
 - [ ] Handle all-invalid frames explicitly. `dioptric_dose` returns 0.0, but a frame with no valid zones is missing data, not zero exposure — do not let it dilute a daily mean.
 - [ ] Code far-field non-returns as band 7, **not** as missing data. Dropping them systematically deletes outdoor time and biases the day toward near.
 - [ ] Cross-check outdoor classification against ALS lux. Genuine far-field and sensor dropout look identical to the TOF alone.
+- [ ] After any lab characterisation pass, edit `veet_tof_confidence_thresholds.json` (not the code) and call `reload_confidence_thresholds()`; record what changed and why outside the file itself (git history), since the file's own `last_updated` field is not authoritative.
 
 ---
 
@@ -203,11 +198,11 @@ Changing any of these silently invalidates comparisons against prior runs. Bump 
 
 **~~FOV axis assignment.~~ RESOLVED.** Each row spans 41° horizontally, so the 8 columns cover 41° and the 8 rows cover 52°. The field is taller than wide. Encoded as `FOV_H_DEG` / `FOV_V_DEG` rather than a bare tuple, because the original `(41, 52)` was assigned the wrong way round and read as plausible either way. Tuples in the module are `(rows, cols)` = `(vertical, horizontal)`; `field_coverage_mm` returns in that order, **not** the conventional width-by-height.
 
-**Corroboration connectivity.** Default is 8-connected (Moore). Under 4-connectivity a corner zone has only two neighbours and is structurally near-impossible to corroborate. Relevant only to the diagnostic path.
+**~~Corroboration connectivity.~~ RESOLVED.** VEET2 always collects the full 8×8 zone grid — there is no reduced-grid configuration where a corner zone would be structurally undercorroborated. Connectivity is fixed at 8-connected (Moore); 4-connectivity is not exposed as an option.
 
 **Mutual validation loophole.** By default two adjacent noisy perimeter zones can corroborate each other. `require_interior_support=True` closes it. On synthetic data the two modes differ substantially in perimeter yield — resolve empirically against bench data if the diagnostic path ever becomes load-bearing.
 
-**Threshold re-derivation.** All eight thresholds need re-deriving against a reference target set spanning the full range, at varying surface reflectance and incidence angle, before any published analysis — and re-expressing in SNR terms rather than the percentages they were originally framed with.
+**Threshold re-derivation.** All eight thresholds need re-deriving against a reference target set spanning the full range, at varying surface reflectance and incidence angle, before any published analysis. The mechanism for updating them is now in place (`veet_tof_confidence_thresholds.json`, §3.2) — what's still open is the lab work to derive the values themselves, not how to apply them.
 
 **Row-guard depth.** One trimmed row per edge brings the field inside the 1/e² illumination cone. Whether the second row also needs trimming is an empirical question; the geometry does not require it.
 
@@ -215,4 +210,4 @@ Changing any of these silently invalidates comparisons against prior runs. Bump 
 
 ## Provenance
 
-Confidence thresholds originate from a preliminary bench characterisation and are explicitly provisional. They were originally described as percentages; per TMF882X datasheet §7.4.7 the underlying quantity is SNR, and that framing has been corrected throughout. Sensor geometry, illumination figures, and the confidence encoding definition are from TMF882X datasheet DS000693 v8-00 (2023-Aug-02), §§7.4.7 and 7.5.2 and Figures 30–32. Reporting-band edges are anchored to published myopia literature: the < 20 cm threshold from the IMI Clinical Management Guidelines, the < 30 cm threshold from the Sydney Myopia Study and the Gajjar 2022 systematic review, and the near/intermediate split from Ostrin's Clouclip and Actiwatch work. Anchors are recorded per-band in `_SPEC` so the provenance travels with the code.
+Confidence thresholds originate from a preliminary bench characterisation and are explicitly provisional — see `veet_tof_confidence_thresholds.json`'s own `provenance`/`last_updated` fields for the currently-loaded values' status, and §3.2 for how to update them. They were originally described as percentages; per TMF882X datasheet §7.4.7 the underlying quantity is SNR, and that framing has been corrected throughout. Sensor geometry, illumination figures, and the confidence encoding definition are from TMF882X datasheet DS000693 v8-00 (2023-Aug-02), §§7.4.7 and 7.5.2 and Figures 30–32. Reporting-band edges are anchored to published myopia literature: the < 20 cm threshold from the IMI Clinical Management Guidelines, the < 30 cm threshold from the Sydney Myopia Study and the Gajjar 2022 systematic review, and the near/intermediate split from Ostrin's Clouclip and Actiwatch work. Anchors are recorded per-band in `_BAND_STRUCTURE` in the source so the provenance travels with the code.
