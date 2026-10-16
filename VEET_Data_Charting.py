@@ -1493,14 +1493,16 @@ class TOFAnalysisWindow(QMainWindow):
         origin = "file" if loaded else "built-in defaults (file not found)"
         prefix = "Reloaded" if reloaded else "Loaded"
         when = datetime.datetime.now().strftime('%H:%M:%S')
+        curve = getattr(tof_bands, 'CONFIDENCE_CURVE_DESCRIPTION', '?')
         self.threshold_status_label.setText(
-            f"{prefix} {when} — confidence thresholds: {origin} — {source}")
+            f"{prefix} {when} — confidence thresholds: {origin} — {source}\n"
+            f"Gate v{getattr(tof_bands, 'CONFIDENCE_GATE_VERSION', '?')}: {curve}")
 
     def _refresh_thresholds_table(self):
-        """Legend tab: the actual gate values currently in effect, per band."""
+        """Legend tab: the gate curve currently in effect, summarised per band."""
         tof_bands = _import_tof_bands()
         table = self.thresholds_table
-        headers = ["Band", "Name", "Distance (mm)", "Vergence (D)", "Min raw (SNR)"]
+        headers = ["Band", "Name", "Distance (mm)", "Vergence (D)", "Min raw (SNR), near→far edge"]
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
         if tof_bands is None:
@@ -1513,7 +1515,7 @@ class TOFAnalysisWindow(QMainWindow):
             d_hi = 'inf' if b.d_max == float('inf') else f"{b.d_max:.2f}"
             values = [
                 str(b.index), b.name, f"{b.z_min_mm:.0f}-{z_hi}",
-                f"{d_hi}-{b.d_min:.2f}", str(b.conf_raw),
+                f"{d_hi}-{b.d_min:.2f}", "{}→{}".format(*tof_bands.band_min_raw_range(b)),
             ]
             for col, text in enumerate(values):
                 item = QTableWidgetItem(text)

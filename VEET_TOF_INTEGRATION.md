@@ -46,10 +46,11 @@ Resolution, per zone per frame:
 1. **Object 1 passes the stage-1 gate** → use it. Object 2 is never inspected.
 2. Otherwise (object 1 is sub-floor/0, or nonzero-but-low-confidence):
    - **Object 2 is sub-floor/0** → confident far (2000 mm), regardless of *why* object 1 failed. A low-confidence object-1 reading is typically a phantom return from diffuse reflection off a nearby surface, so it must not override a clean "nothing there" from object 2.
+     **Exception — weak near return with nothing behind it.** If object 1 is a real (≥ 10 mm) reading that fails the gate *and* is nearer than `weak_unbacked_exclude_below_mm` (config, default 400 mm), the zone is **ambiguous (excluded)** instead of confident far. A genuine near surface also blocks object 2, so a real but dim near target (skin, dark material) is indistinguishable here from a phantom; recoding it as far would bias near-work time downward, while excluding it only costs data. A zero/sub-floor object 1 is a no-return, not a weak return, and still resolves far. Legacy per-band (v1) configs load with the rule disabled so they reproduce the old gate exactly. In session 25060544-4 this moved 5.7 zone-hours (3.4% of analysis-field zone-time) from far to excluded and left every other band unchanged.
    - **Object 2 passes the stage-1 gate** → "rescued": object 2's `(z, conf)` becomes the resolved measurement.
    - **Object 2 is also nonzero-but-low-confidence** → ambiguous. Neither return can be trusted; the zone is excluded and counted (see `zone_yield`'s `ambiguous_dual_return_fraction`), not silently mis-binned.
 
-Object 2 is gated by the same distance-dependent thresholds as object 1 (§3.2 table) — same sensor, same characterisation curve, no separate threshold.
+Object 2 is gated by the same 10 mm threshold curve as object 1 (§3.2), looked up at object 2's own distance — same sensor, same characterisation curve, no separate threshold.
 
 **Encoding, not a second mask.** The ambiguous branch resolves to `conf_resolved = 0` paired with `z_resolved = z2` (always ≥ the floor in that branch). This guarantees the zone fails the ordinary stage-1 confidence check on its own, so `valid_mask`/`analysis_mask`/`dioptric_histogram`/`dioptric_dose`/`band_index`/`to_diopters` all keep working unchanged on the resolved array — no dual-return-aware branch needed anywhere downstream, and `analysis_mask` remains the sole reporting path (Invariant §6.2).
 
@@ -65,26 +66,53 @@ Object 2 is gated by the same distance-dependent thresholds as object 1 (§3.2 t
 
 VEET2 firmware is fixed to linear confidence encoding (`logarithmic_confidence = 0`, confirmed against deployed firmware); the TMF8828's logarithmic mode exists in silicon but is not exposed on this hardware. Under linear encoding the raw byte *is* the SNR, clipped at 255.
 
-Confidence required scales with measured distance — weak far returns are cheap and common, weak near returns are suspicious:
+Confidence required scales with measured distance — weak far returns are cheap and common, weak near returns are suspicious.
 
-| Band | Name | Distance (mm) | Vergence (D) | Min raw (SNR) |
+**The threshold is a continuous curve on a 10 mm grid, not one value per reporting band** (`CONFIDENCE_GATE_VERSION = 3`: v2 introduced the curve, v3 added the weak-near-unbacked exclusion in §3.1). Each zone's own measured distance selects a 10 mm bin — bin *i* covers `[10 + 10i, 20 + 10i)` mm from `Z_FLOOR_MM` up to 2000 mm, plus one open-ended bin ≥ 2000 mm — and the bin's threshold is the curve evaluated at the bin's near edge (the most conservative value in the bin, since the curve falls with distance). The curve is:
+
+```
+min_raw(d) = clip(ceil(a · d^-k), floor_min_raw, 255)        d in mm
+```
+
+`a` and `k` are not stored. They are fit at load time by least squares in log-log space through the bench **anchor points** in the config file. Anchors at exactly 0 or 255 are clipped by the byte encoding (the true requirement is unknown), so they are excluded from the fit rather than flattening its slope. `floor_min_raw` (currently 10) stops the far tail from falling below anything bench data supports; a pure power law would reach ~5 at 2000 mm. A fit that rises with distance (`k ≤ 0`) raises rather than loading — it means the anchors are wrong.
+
+Shipped curve (from the 2026-10 bench anchors: `a ≈ 2.44e6`, `k ≈ 1.72`, floor 10), summarised at the reporting bands for reference only:
+
+| Band | Name | Distance (mm) | Vergence (D) | Min raw (SNR), near → far edge |
 |---|---|---|---|---|
-| 0 | `artifact_occlusion` | < 100 | > 10.0 | 243 |
-| 1 | `extreme_near` | 100–200 | 10.00–5.00 | 230 |
-| 2 | `close_near` | 200–300 | 5.00–3.33 | 205 |
-| 3 | `standard_near` | 300–400 | 3.33–2.50 | 154 |
-| 4 | `near_intermediate` | 400–600 | 2.50–1.67 | 103 |
-| 5 | `intermediate` | 600–1000 | 1.67–1.00 | 77 |
-| 6 | `room` | 1000–2000 | 1.00–0.50 | 64 |
-| 7 | `far` | > 2000 | < 0.50 | 52 |
+| 0 | `artifact_occlusion` | < 100 | > 10.0 | 255 → 255 |
+| 1 | `extreme_near` | 100–200 | 10.00–5.00 | 255 → 255 |
+| 2 | `close_near` | 200–300 | 5.00–3.33 | 255 → 142 |
+| 3 | `standard_near` | 300–400 | 3.33–2.50 | 134 → 86 |
+| 4 | `near_intermediate` | 400–600 | 2.50–1.67 | 82 → 42 |
+| 5 | `intermediate` | 600–1000 | 1.67–1.00 | 41 → 18 |
+| 6 | `room` | 1000–2000 | 1.00–0.50 | 17 → 10 |
+| 7 | `far` | > 2000 | < 0.50 | 10 |
 
-The table above shows the shipped defaults. **These are lab-editable, not hardcoded.** `min_raw` per band loads from `veet_tof_confidence_thresholds.json` (alongside `veet_tof_bands.py`) at import time; band geometry (the mm/vergence columns) does not live there and is not lab-tunable, since it's coupled to the dioptric histogram (Invariant §6.1). Edit the JSON's `min_raw_by_band` map after each characterisation pass — you only need to list the bands that changed, anything omitted keeps its built-in default. Call `veet_tof_bands.reload_confidence_thresholds()` to pick up an edit without restarting a running session — both `VEET_TOF_Viewer.py` and `VEET_Data_Charting.py`'s TOF Analysis window expose this as a "Reload Confidence Thresholds" button, re-analyze the loaded session, and confirm explicitly (status bar message + a "Confidence Thresholds" legend tab showing what's now loaded) — a reload is never silent. A bad value (wrong type, out of 0–255, or an unrecognised band name) raises immediately rather than gating silently on garbage. `CONFIDENCE_THRESHOLDS_SOURCE` reports which file (or "not found; using built-in defaults") is currently in effect.
+`python veet_tof_bands.py` prints this table for whatever is currently loaded.
+
+**Lab-editable, not hardcoded.** The curve loads from `veet_tof_confidence_thresholds.json` (alongside `veet_tof_bands.py`) at import time:
+
+```json
+{
+  "format_version": 2,
+  "rule": "power_law_fit",
+  "floor_min_raw": 10,
+  "anchors": [[200, 245], [250, 200], [300, 150], ...]
+}
+```
+
+`anchors` are `[distance_mm, min_raw]` pairs, strictly increasing in distance, each distance ≥ 10 mm and each value an integer 0–255. Edit the anchors (or the floor) after each characterisation pass. `veet_tof_confidence_bench.py` writes ready-to-load candidate files (`candidate_thresholds_<mode>.json`) from its per-point recommendations, so anchors don't have to be transcribed by hand. Reporting-band geometry is not in this file and is not lab-tunable, since it's coupled to the dioptric histogram (Invariant §6.1). The gate and the bands are now deliberately separate: refining the curve never moves a reporting edge.
+
+Legacy per-band files (`{"min_raw_by_band": {...}}`, format v1) still load, as a step curve that reproduces the old per-band gate exactly. Use them for before/after regression comparisons. With no file at all, the gate falls back to a step curve built from the preliminary built-in per-band defaults.
+
+Call `veet_tof_bands.reload_confidence_thresholds()` to pick up an edit without restarting a running session. Both `VEET_TOF_Viewer.py` and `VEET_Data_Charting.py`'s TOF Analysis window expose this as a "Reload Confidence Thresholds" button, re-analyze the loaded session, and confirm explicitly: a status bar message, plus a "Confidence Thresholds" legend tab showing the source file, the fitted `a`/`k`/floor and each band's near→far threshold. A reload is never silent. A malformed file (bad value, unknown band name, unsorted anchors, too few usable anchors, a rising fit) raises immediately and leaves the previous curve in effect, rather than gating silently on garbage. `CONFIDENCE_THRESHOLDS_SOURCE`, `CONFIDENCE_RULE`, `CONFIDENCE_FIT` and `CONFIDENCE_CURVE_DESCRIPTION` report what's currently in effect.
 
 The gate compares raw values directly, so decoding is never needed on the hot path. `confidence_to_snr()` exists for diagnostics.
 
 Band edges are inclusive-low, exclusive-high: a reading of exactly 100 mm belongs to band 1.
 
-**Known limitation — the gate is self-referential.** The threshold is looked up using the very reading being evaluated. A spurious 1500 mm return needs only raw ≥ 64; a genuine 150 mm return needs raw ≥ 230. Errors that *inflate* distance are therefore policed far more loosely than errors that shorten it, and inflation is the more common TOF failure mode. The residual bias pushes the dioptric distribution toward the far tail — precisely the direction that erodes the near-work signal. This is accepted, not solved. Do not remove the comment documenting it.
+**Known limitation — the gate is self-referential.** The threshold is looked up using the very reading being evaluated. With the shipped curve, a spurious 1500 mm return needs only raw ≥ 10; a genuine 150 mm return needs raw ≥ 255. (Under the old per-band step gate these were 64 and 230. The bench data says far returns really are that weak, but the asymmetry is now steeper.) Errors that *inflate* distance are therefore policed far more loosely than errors that shorten it, and inflation is the more common TOF failure mode. The residual bias pushes the dioptric distribution toward the far tail — precisely the direction that erodes the near-work signal. This is accepted, not solved. Do not remove the comment documenting it.
 
 ### 3.3 Analysis field (stage 2)
 
@@ -141,6 +169,7 @@ from veet_tof_bands import (
     dioptric_histogram, dioptric_dose,
     zone_mask, spatial_corroboration, zone_yield, field_coverage_mm,
     resolve_dual_return, reload_confidence_thresholds,
+    confidence_curve, band_min_raw_range, fit_power_law,
 )
 ```
 
@@ -148,13 +177,16 @@ from veet_tof_bands import (
 |---|---|---|
 | `analysis_mask(z, c)` | bool `(...,8,8)` | **Primary.** Gate ∩ analysis field. All reporting derives from this. |
 | `valid_mask(z, c)` | bool `(...,8,8)` | Stage 1 only. Use when you need the gate independent of the field. |
-| `reload_confidence_thresholds(path=None)` | `BANDS` | Re-read `CONFIDENCE_THRESHOLDS_PATH` (or `path`) and rebuild `BANDS`/the gate in place — the lab-characterisation edit loop. See §3.2. |
+| `reload_confidence_thresholds(path=None)` | int `(200,)` | Re-read `CONFIDENCE_THRESHOLDS_PATH` (or `path`), re-fit, and rebuild the 10 mm gate curve in place — the lab-characterisation edit loop. Returns the new curve. See §3.2. |
+| `confidence_curve()` | `(bin_lo_mm, min_raw)` | The 10 mm curve currently in effect, for display/export. |
+| `band_min_raw_range(band)` | `(int, int)` | Threshold at a reporting band's near and far edge — display only. |
+| `fit_power_law(anchors, floor)` | `PowerLawFit` | The load-time fit, exposed so the bench produces exactly the curve a candidate JSON will load as. |
 | `resolve_dual_return(z1, c1, z2, c2)` | `(z, conf, ambiguous)` | **Stage 0, mandatory.** Folds object 1/object 2 into one `(z, conf)` pair; feed the result into `valid_mask`/`analysis_mask` exactly like a single-return pair. See §3.1. |
 | `to_diopters(z)` | float, same shape | Vergence, far tail clamped. |
 | `dioptric_histogram(z, c, dt)` | float `(41,)` | Time-weighted, seconds per bin. Last element is overflow. |
 | `dioptric_dose(z, c, dt)` | float | Dioptre-hours. The distance analogue of lux-hours. |
 | `band_index(z)` | int `(...,8,8)` | Reporting band 0–7. |
-| `min_confidence(z)` | int `(...,8,8)` | Required raw confidence at each distance. |
+| `min_confidence(z)` | int `(...,8,8)` | Required raw confidence at each distance (10 mm curve lookup). |
 | `field_coverage_mm(z, field)` | `(float, float)` | Scene extent in mm at a distance. |
 | `zone_yield(z, c, ambiguous_mask=None)` | dict | **Diagnostic.** Per-stage yields including guard-band health; adds `ambiguous_dual_return_fraction` when `ambiguous_mask` (from `resolve_dual_return`) is passed. |
 | `confidence_to_snr(raw, enc)` | float, same shape | **Diagnostic.** Decode raw byte to SNR. Raises if encoding unknown. |
@@ -168,7 +200,7 @@ from veet_tof_bands import (
 
 Changing any of these silently invalidates comparisons against prior runs. Bump a version constant and re-run the full pipeline if you touch them.
 
-1. Band edges (mm/vergence geometry) and dioptric bin edges must stay coupled — one band table, two uses. Unlike the confidence thresholds (§3.2), band geometry is not exposed for lab editing.
+1. Band edges (mm/vergence geometry) and dioptric bin edges must stay coupled. Band geometry is not exposed for lab editing. The confidence gate is deliberately *not* tied to the bands: it is a separate 10 mm curve (§3.2), so tuning it never moves a reporting edge. `CONFIDENCE_GATE_VERSION` (currently 3: the 10 mm curve plus the weak-near-unbacked exclusion; 2 was the curve alone, 1 the per-band step gate) must be bumped if gate semantics change, and outputs from different gate versions must not be compared directly.
 2. `CONFIDENCE_ENCODING` is fixed at `"linear"` — VEET2 firmware does not expose the logarithmic option, so no per-session assertion is needed.
 2. `analysis_mask` is the only path to reported measures. `resolve_dual_return` runs strictly upstream of stage 1 for every session; ambiguous zones are excluded via `conf_resolved = 0`, which stage 1 already rejects, not via a separate mask threaded through the pipeline.
 3. `spatial_corroboration` is single-pass. Adjacency is evaluated against the stage-1 mask, so pruning a zone never cascades into pruning its neighbour. Iterative erosion would be order-dependent — do not "improve" it into a loop.
@@ -190,7 +222,8 @@ Changing any of these silently invalidates comparisons against prior runs. Bump 
 - [ ] Handle all-invalid frames explicitly. `dioptric_dose` returns 0.0, but a frame with no valid zones is missing data, not zero exposure — do not let it dilute a daily mean.
 - [ ] Code far-field non-returns as band 7, **not** as missing data. Dropping them systematically deletes outdoor time and biases the day toward near.
 - [ ] Cross-check outdoor classification against ALS lux. Genuine far-field and sensor dropout look identical to the TOF alone.
-- [ ] After any lab characterisation pass, edit `veet_tof_confidence_thresholds.json` (not the code) and call `reload_confidence_thresholds()`; record what changed and why outside the file itself (git history), since the file's own `last_updated` field is not authoritative.
+- [ ] Before adopting a new thresholds config, run real sessions through it with `python veet_tof_gate_compare.py <device folder> [--candidate new.json]`. By default this compares against the frozen pre-curve gate (`veet_tof_confidence_thresholds_v1_2026-08-12.json`, do not edit). It reports outcome shares, yields, dose and band hours for both gates, plus which zone-frames were gained, lost or moved, and how coherent they are against unchanged ones. Output goes to `<device folder>/gate_comparison/`.
+- [ ] After any lab characterisation pass, edit the anchors in `veet_tof_confidence_thresholds.json` (or start from a bench `candidate_thresholds_<mode>.json`), not the code, and call `reload_confidence_thresholds()`; record what changed and why outside the file itself (git history), since the file's own `last_updated` field is not authoritative.
 
 ---
 
@@ -202,7 +235,7 @@ Changing any of these silently invalidates comparisons against prior runs. Bump 
 
 **Mutual validation loophole.** By default two adjacent noisy perimeter zones can corroborate each other. `require_interior_support=True` closes it. On synthetic data the two modes differ substantially in perimeter yield — resolve empirically against bench data if the diagnostic path ever becomes load-bearing.
 
-**Threshold re-derivation.** All eight thresholds need re-deriving against a reference target set spanning the full range, at varying surface reflectance and incidence angle, before any published analysis. The mechanism for updating them is now in place (`veet_tof_confidence_thresholds.json`, §3.2) — what's still open is the lab work to derive the values themselves, not how to apply them.
+**Threshold re-derivation.** The gate is now a power-law curve fit to bench anchors (§3.2). The current anchors come from flat paper/phone targets at 0° and 30°, with and without a wall behind, and object data covers only ~200–700 mm; below 200 mm the curve is extrapolated (it saturates at 255), and above ~1250 mm it sits on the floor. The anchors still need validating against a reference target set spanning the full range, at varying surface reflectance and incidence angle, before any published analysis. Also still open: whether the floor of 10 is right, and how much worse the self-referential bias (§3.2) gets with the lower far-field thresholds.
 
 **Row-guard depth.** One trimmed row per edge brings the field inside the 1/e² illumination cone. Whether the second row also needs trimming is an empirical question; the geometry does not require it.
 

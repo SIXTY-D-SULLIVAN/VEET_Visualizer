@@ -1,0 +1,15 @@
+{
+  "_readme": "FROZEN REFERENCE -- not loaded by default. The per-band (format v1) confidence thresholds that were live from 2026-08-12 until the 10 mm power-law curve (gate v2) replaced them on 2026-10-08. Kept so veet_tof_gate_compare.py can reproduce 'old gate vs new gate' on any session. Do not edit.",
+  "provenance": "preliminary bench characterisation, pre-validation -- see VEET_TOF_INTEGRATION.md Provenance",
+  "last_updated": "2026-08-12",
+  "min_raw_by_band": {
+    "artifact_occlusion": 243,
+    "extreme_near": 230,
+    "close_near": 205,
+    "standard_near": 154,
+    "near_intermediate": 103,
+    "intermediate": 77,
+    "room": 64,
+    "far": 20
+  }
+}

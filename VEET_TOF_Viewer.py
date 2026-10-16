@@ -531,9 +531,10 @@ class ThresholdsTab(QWidget):
         prefix = "Reloaded" if reloaded else "Loaded"
         when = datetime.datetime.now().strftime('%H:%M:%S')
         self.source_label.setText(
-            f"{prefix} {when} — confidence thresholds: {origin} — {tb.CONFIDENCE_THRESHOLDS_SOURCE}")
+            f"{prefix} {when} — confidence thresholds: {origin} — {tb.CONFIDENCE_THRESHOLDS_SOURCE}\n"
+            f"Gate v{tb.CONFIDENCE_GATE_VERSION}, {tb.CONF_BIN_MM:.0f} mm bins: {tb.CONFIDENCE_CURVE_DESCRIPTION}")
 
-        headers = ["Band", "Name", "Distance (mm)", "Vergence (D)", "Min raw (SNR)"]
+        headers = ["Band", "Name", "Distance (mm)", "Vergence (D)", "Min raw (SNR), near→far edge"]
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
         bands = tb.BANDS
@@ -543,7 +544,7 @@ class ThresholdsTab(QWidget):
             d_hi = 'inf' if b.d_max == float('inf') else f"{b.d_max:.2f}"
             values = [
                 str(b.index), b.name, f"{b.z_min_mm:.0f}-{z_hi}",
-                f"{d_hi}-{b.d_min:.2f}", str(b.conf_raw),
+                f"{d_hi}-{b.d_min:.2f}", "{}→{}".format(*tb.band_min_raw_range(b)),
             ]
             for col, text in enumerate(values):
                 item = QTableWidgetItem(text)

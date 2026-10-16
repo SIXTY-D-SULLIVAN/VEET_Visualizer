@@ -4,7 +4,7 @@ Single source of truth for VEET 2 time-of-flight (TOF) validity gating and diopt
 
 For the full technical spec — provenance, invariants, integration checklist, open questions — see [VEET_TOF_INTEGRATION.md](VEET_TOF_INTEGRATION.md). This document is the practical, task-oriented companion: what to import, what to call, what the numbers mean, and what breaks if you get it wrong.
 
-> **Status: pre-validation.** Confidence thresholds are from a preliminary bench characterisation and are not yet re-derived against a reference target set — see [Confidence encoding](#confidence-encoding-read-this-first).
+> **Status: pre-validation.** The confidence gate is a power-law curve fit to bench anchors (paper/phone targets, ~200–2000 mm). It has not yet been validated against a reference target set — see [Confidence encoding](#confidence-encoding-read-this-first).
 
 ---
 
@@ -44,7 +44,7 @@ For the full technical spec — provenance, invariants, integration checklist, o
 - Reports field-of-view geometry and per-distance scene coverage (`field_coverage_mm`)
 - Reports pipeline health/yield stats for QA and cross-device comparison (`zone_yield`)
 
-The validity gate and the reporting histogram are defined from the **same** band table specifically so they cannot drift apart as thresholds are tuned. Confidence thresholds are lab-editable via a JSON config file (see [Distance bands](#distance-bands)); band geometry is not.
+The validity gate and the reporting bands are deliberately **separate**. The gate is a continuous threshold curve on a 10 mm grid, looked up from each zone's own measured distance. The 8 reporting bands only classify and bin. Refining the curve therefore never moves a reporting edge. The curve is lab-editable via a JSON config file (see [Confidence thresholds are lab-editable](#confidence-thresholds-are-lab-editable)); band geometry is not.
 
 ## What this module does not do
 
@@ -124,22 +124,31 @@ VEET2 firmware is fixed to linear confidence encoding (`logarithmic_confidence =
 
 ## Confidence thresholds are lab-editable
 
-The per-band `min_raw` values (the "Min raw confidence" column in [Distance bands](#distance-bands)) load from `veet_tof_confidence_thresholds.json`, a JSON file next to `veet_tof_bands.py`, at import time — not hardcoded. Band geometry (mm ranges) is not in that file and is not meant to change; only the confidence thresholds are expected to move as lab characterisation proceeds.
+The gate threshold (`min_confidence(z)`) is a curve, sampled on a 10 mm grid from 10 mm to 2000 mm plus one open-ended bin ≥ 2000 mm. Each bin uses the curve's value at its near edge. The curve is
+
+```
+min_raw(d) = clip(ceil(a · d^-k), floor_min_raw, 255)        d in mm
+```
+
+with `a` and `k` fit at load time (least squares, log-log) through bench anchor points in `veet_tof_confidence_thresholds.json`, next to `veet_tof_bands.py`:
 
 ```json
 {
-  "min_raw_by_band": {
-    "far": 52,
-    "room": 64
-  }
+  "format_version": 2,
+  "rule": "power_law_fit",
+  "floor_min_raw": 10,
+  "anchors": [[200, 245], [250, 200], [300, 150], [400, 100], [600, 50], [1000, 15], [2000, 10]]
 }
 ```
 
-- List only the bands you're changing — anything omitted keeps its built-in default (the values shown in [Distance bands](#distance-bands)).
-- `veet_tof_bands.reload_confidence_thresholds(path=None)` re-reads the file and rebuilds `BANDS` in place, so a running session doesn't need restarting after an edit. Both `VEET_TOF_Viewer.py` and `VEET_Data_Charting.py`'s TOF Analysis window expose this as a "Reload Confidence Thresholds" button that re-analyzes the loaded session and confirms explicitly (status bar message, and a "Confidence Thresholds" tab listing every band's currently-loaded value) — you shouldn't have to guess whether a reload picked anything up.
-- A malformed value (wrong type, outside 0–255, or an unrecognised band name) raises `ValueError` immediately — it does not gate silently on garbage.
-- `CONFIDENCE_THRESHOLDS_SOURCE` / `CONFIDENCE_THRESHOLDS_LOADED_FROM_FILE` report what's currently in effect (the file path, or a "not found, using built-in defaults" fallback).
-- Functions that read `BANDS` via the module (`tb.BANDS`, `tb.min_confidence(...)`, etc.) see a reload immediately. A caller that did `from veet_tof_bands import BANDS` earlier keeps a stale copy — re-fetch via the module after reloading.
+- `anchors` are `[distance_mm, min_raw]`, strictly increasing in distance, distance ≥ 10 mm, value an integer 0–255. Anchors at exactly 0 or 255 are clipped by the encoding and are excluded from the fit.
+- `floor_min_raw` clamps the far tail (default 10). Near range saturates at 255.
+- `veet_tof_confidence_bench.py` writes ready-to-load `candidate_thresholds_<mode>.json` files from its per-point recommendations, using the same `fit_power_law` the module uses at load.
+- Legacy per-band files (`{"min_raw_by_band": {"far": 52, ...}}`) still load, as a step curve identical to the old per-band gate. They're useful for before/after comparisons. No file at all falls back to a step curve of the preliminary built-in defaults.
+- `veet_tof_bands.reload_confidence_thresholds(path=None)` re-reads the file, re-fits, and rebuilds the curve in place, so a running session doesn't need restarting after an edit. Both `VEET_TOF_Viewer.py` and `VEET_Data_Charting.py`'s TOF Analysis window expose this as a "Reload Confidence Thresholds" button that re-analyzes the loaded session and confirms explicitly: a status bar message, plus a "Confidence Thresholds" tab showing the fit (`a`, `k`, floor) and each band's near→far threshold.
+- A malformed file (bad value, unsorted anchors, fewer than two usable anchors, a fit that rises with distance, unknown band name in a legacy file) raises `ValueError` immediately and leaves the previous curve in effect. It does not gate silently on garbage.
+- `CONFIDENCE_THRESHOLDS_SOURCE`, `CONFIDENCE_THRESHOLDS_LOADED_FROM_FILE`, `CONFIDENCE_RULE`, `CONFIDENCE_FIT` and `CONFIDENCE_CURVE_DESCRIPTION` report what's currently in effect. `confidence_curve()` returns the full 10 mm table.
+- `CONFIDENCE_GATE_VERSION` is 3 (10 mm curve + weak-near-unbacked exclusion); 2 was the curve alone, 1 the per-band step gate. Don't compare yields or histograms across gate versions as if nothing changed.
 
 ## The two-stage (three-stage) validity pipeline
 
@@ -157,6 +166,7 @@ The TMF8828 always reports two returns per zone: object 1 (primary/strongest) an
 1. **Object 1 passes the stage-1 gate** → used as-is; object 2 is never inspected.
 2. Otherwise:
    - **Object 2 is sub-floor (no second target)** → resolved as confident far (2000 mm, `CONF_MAX`), regardless of why object 1 failed. A phantom low-confidence object-1 return must not override a clean "nothing there" from object 2.
+     **Exception — weak near return with nothing behind it.** If object 1 is a real (≥ 10 mm) reading that fails the gate *and* is nearer than `weak_unbacked_exclude_below_mm` (config, default 400 mm), the zone is **ambiguous (excluded)** instead of confident far. A genuine near surface also blocks object 2, so a real but dim near target (skin, dark material) is indistinguishable here from a phantom; recoding it as far would bias near-work time downward, while excluding it only costs data. A zero/sub-floor object 1 is a no-return, not a weak return, and still resolves far. Legacy per-band (v1) configs load with the rule disabled so they reproduce the old gate exactly. In session 25060544-4 this moved 5.7 zone-hours (3.4% of analysis-field zone-time) from far to excluded and left every other band unchanged.
    - **Object 2 passes the stage-1 gate** → "rescued": object 2's `(z, conf)` becomes the resolved measurement.
    - **Object 2 is also nonzero-but-low-confidence** → ambiguous. Encoded as `conf_resolved = 0` (paired with `z_resolved = z2`), which guarantees the zone fails the ordinary stage-1 check with no separate exclusion mask needed anywhere downstream. Returned as the third tuple element, `ambiguous_mask`, purely for counting (feed it to `zone_yield`).
 
@@ -185,22 +195,22 @@ Corroboration is single-pass: adjacency is checked against the *stage-1* mask, s
 
 ## Distance bands
 
-Eight bands, defined once and used for both the confidence gate and the reporting bin. Edges are inclusive-low, exclusive-high (100 mm belongs to band 1, not band 0). Band geometry (the mm/vergence columns) is fixed in source (`_BAND_STRUCTURE`); **the "Min raw confidence" column is lab-editable** — see [Confidence encoding](#confidence-encoding-read-this-first) below, this table shows the shipped defaults.
+Eight literature-anchored reporting bands. Edges are inclusive-low, exclusive-high (100 mm belongs to band 1, not band 0). Band geometry is fixed in source (`_BAND_STRUCTURE`). The bands no longer carry their own confidence threshold; the last column below just shows what the shipped 10 mm gate curve does across each band (`band_min_raw_range(band)`).
 
-| # | Name | Range (mm) | Vergence (D) | Min raw confidence | Anchor |
+| # | Name | Range (mm) | Vergence (D) | Gate min raw, near → far edge | Anchor |
 |---|---|---|---|---|---|
-| 0 | `artifact_occlusion` | 0–100 | > 10.0 | 243 | sub-100 mm, treat as occlusion |
-| 1 | `extreme_near` | 100–200 | 10.0–5.0 | 230 | IMI <20 cm risk threshold |
-| 2 | `close_near` | 200–300 | 5.0–3.33 | 205 | Sydney Myopia Study; Gajjar 2022 |
-| 3 | `standard_near` | 300–400 | 3.33–2.5 | 154 | clinical near reference 33/40 cm |
-| 4 | `near_intermediate` | 400–600 | 2.5–1.67 | 103 | upper edge of Ostrin near band |
-| 5 | `intermediate` | 600–1000 | 1.67–1.0 | 77 | Ostrin intermediate band |
-| 6 | `room` | 1000–2000 | 1.0–0.5 | 64 | — |
-| 7 | `far` | 2000–∞ | < 0.5 | 52 | effective optical infinity |
+| 0 | `artifact_occlusion` | 0–100 | > 10.0 | 255 → 255 | sub-100 mm, treat as occlusion |
+| 1 | `extreme_near` | 100–200 | 10.0–5.0 | 255 → 255 | IMI <20 cm risk threshold |
+| 2 | `close_near` | 200–300 | 5.0–3.33 | 255 → 142 | Sydney Myopia Study; Gajjar 2022 |
+| 3 | `standard_near` | 300–400 | 3.33–2.5 | 134 → 86 | clinical near reference 33/40 cm |
+| 4 | `near_intermediate` | 400–600 | 2.5–1.67 | 82 → 42 | upper edge of Ostrin near band |
+| 5 | `intermediate` | 600–1000 | 1.67–1.0 | 41 → 18 | Ostrin intermediate band |
+| 6 | `room` | 1000–2000 | 1.0–0.5 | 17 → 10 | — |
+| 7 | `far` | 2000–∞ | < 0.5 | 10 | effective optical infinity |
 
-Run the module directly (`python veet_tof_bands.py`) to print the table **as currently loaded** — it reflects any edits to `veet_tof_confidence_thresholds.json`, not just the defaults above.
+Run the module directly (`python veet_tof_bands.py`) to print the table **as currently loaded**, including the fitted `a`/`k`. It reflects any edits to `veet_tof_confidence_thresholds.json`.
 
-Each `Band` is a frozen dataclass with `.d_max`/`.d_min` properties (vergence at the near/far edge). `band_index(z_mm)` and `min_confidence(z_mm)` do the vectorised lookup via `np.searchsorted`.
+Each `Band` is a frozen dataclass with `.d_max`/`.d_min` properties (vergence at the near/far edge). `band_index(z_mm)` and `min_confidence(z_mm)` each do their own vectorised `np.searchsorted` lookup, one on the band edges and the other on the 10 mm gate grid.
 
 ## Dioptric conversion and binning
 
@@ -233,7 +243,7 @@ from veet_tof_bands import (
 |---|---|---|
 | `analysis_mask(z, c)` | bool `(...,8,8)` | **Primary reporting path.** Gate ∩ analysis field. |
 | `valid_mask(z, c)` | bool `(...,8,8)` | Stage 1 only, all 64 zones. |
-| `reload_confidence_thresholds(path=None)` | `BANDS` | Re-read `veet_tof_confidence_thresholds.json` (or `path`) and rebuild the gate in place. See [Confidence thresholds are lab-editable](#confidence-thresholds-are-lab-editable). |
+| `reload_confidence_thresholds(path=None)` | int `(200,)` | Re-read `veet_tof_confidence_thresholds.json` (or `path`), re-fit, and rebuild the 10 mm gate curve in place. See [Confidence thresholds are lab-editable](#confidence-thresholds-are-lab-editable). |
 | `resolve_dual_return(z1, c1, z2, c2)` | `(z, conf, ambiguous)` | Stage 0, mandatory. Output feeds straight into `valid_mask`/`analysis_mask`. |
 | `to_diopters(z, z_cap_mm=2000.0)` | float, same shape | Vergence, far tail clamped. No masking applied — mask separately. |
 | `dioptric_histogram(z, c, sample_period_s=5.0)` | float `(41,)` | Seconds per bin; last bin is overflow (> 10 D / < 100 mm). |
@@ -245,7 +255,10 @@ from veet_tof_bands import (
 | `confidence_to_snr(raw, encoding=None)` | float, same shape | Diagnostic. Decodes raw byte to true SNR; raises if encoding unknown. |
 | `zone_mask(z, c, connectivity=8, require_interior_support=False)` | bool `(...,8,8)` | Diagnostic only — never for reported measures. |
 | `spatial_corroboration(gate_mask, connectivity=8, require_interior_support=False)` | bool, same shape | Diagnostic only. Operates on an existing stage-1 mask. |
-| `BANDS` | `tuple[Band, ...]` | The 8 bands, source of truth for both gate and histogram. |
+| `BANDS` | `tuple[Band, ...]` | The 8 reporting bands. Geometry only; the gate is the separate 10 mm curve. |
+| `confidence_curve()` | `(bin_lo_mm, min_raw)` | The 10 mm gate curve currently in effect. |
+| `band_min_raw_range(band)` | `(int, int)` | Gate threshold at a band's near/far edge. Display only. |
+| `fit_power_law(anchors, floor_min_raw=10)` | `PowerLawFit` | The load-time fit; `.evaluate(z)`, `.a`, `.k`, `.describe()`. |
 | `GRID_SHAPE` | `(8, 8)` | |
 | `ANALYSIS_FIELD` / `PERIMETER` / `INTERIOR` | bool `(8, 8)` | Field masks. `ANALYSIS_FIELD` = `~PERIMETER`. |
 | `FOV_FULL_DEG` / `FOV_ANALYSIS_DEG` | `(vertical_deg, horizontal_deg)` | |

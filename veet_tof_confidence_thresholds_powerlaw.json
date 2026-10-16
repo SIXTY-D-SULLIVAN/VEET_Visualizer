@@ -1,0 +1,16 @@
+{
+  "_readme": "Candidate revised thresholds for veet_tof_bands.py, proposed after reviewing the TOF_Conf_Test-2obj (wall-behind) bench results. The recommended-vs-distance pattern from that data looked like a power-law decay, consistent with a linear (non-normalized) confidence encoding over an inverse-square-ish sensing regime. Formula: min_raw(d) = min(255, 1,000,000 * d^-1.6), evaluated at each band's lower edge (z_min_mm; band0 uses the sensor's real floor of 10mm since z_min=0 is undefined, band 'far' uses its finite lower edge of 2000mm). This file is a candidate for comparison -- it does NOT replace veet_tof_confidence_thresholds.json.",
+  "formula": "min_raw(d_mm) = min(255, 1000000 * d_mm ** -1.6)",
+  "evaluated_at": "band lower edge (z_min_mm), band0 floored at 10mm, far band evaluated at 2000mm",
+  "derived_from": "TOF_Conf_Test-2obj bench review, 2026-09-17",
+  "min_raw_by_band": {
+    "artifact_occlusion": 255,
+    "extreme_near": 255,
+    "close_near": 208,
+    "standard_near": 109,
+    "near_intermediate": 69,
+    "intermediate": 36,
+    "room": 16,
+    "far": 5
+  }
+}
