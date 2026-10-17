@@ -50,6 +50,16 @@ PRESETS = {
         include="phone", exclude="30deg", w_mm=75.0, h_mm=160.0, tol_frac=0.15),
     "Phone -- 30 deg back tilt": dict(
         include="phone,30deg", exclude="", w_mm=75.0, h_mm=160.0, tol_frac=0.25),
+    # Children's near-work stand-ins (2026-10 bench round). Landscape as
+    # presented: w = horizontal (columns), h = vertical (rows).
+    "iPad -- flat / normal (0 deg)": dict(
+        include="ipad", exclude="30deg", w_mm=240.0, h_mm=170.0, tol_frac=0.15),
+    "Switch (handheld console) -- flat / normal (0 deg)": dict(
+        include="switch", exclude="30deg", w_mm=240.0, h_mm=100.0, tol_frac=0.15),
+    # Screen only (keyboard is below/nearer and not part of the footprint);
+    # wider tolerance because the screen sits at its hinge angle, not square-on.
+    "Laptop screen -- at hinge angle": dict(
+        include="laptop", exclude="", w_mm=356.0, h_mm=240.0, tol_frac=0.25),
     "Custom...": dict(include="", exclude="", w_mm=200.0, h_mm=125.0, tol_frac=0.15),
 }
 
