@@ -4,7 +4,7 @@ Single source of truth for VEET 2 time-of-flight (TOF) validity gating and diopt
 
 For the full technical spec — provenance, invariants, integration checklist, open questions — see [VEET_TOF_INTEGRATION.md](VEET_TOF_INTEGRATION.md). This document is the practical, task-oriented companion: what to import, what to call, what the numbers mean, and what breaks if you get it wrong.
 
-> **Status: pre-validation.** The confidence gate is a power-law curve fit to bench anchors (paper/phone targets, ~200–2000 mm). It has not yet been validated against a reference target set — see [Confidence encoding](#confidence-encoding-read-this-first).
+> **Status: pre-validation.** The confidence gate is a power-law curve fit to bench anchors (paper/phone targets, ~200–2000 mm, plus near-work targets — iPad, Switch, laptop, picture book — at ~400–675 mm). It has not yet been validated against a reference target set — see [Confidence encoding](#confidence-encoding-read-this-first).
 
 ---
 
@@ -200,11 +200,11 @@ Eight literature-anchored reporting bands. Edges are inclusive-low, exclusive-hi
 | # | Name | Range (mm) | Vergence (D) | Gate min raw, near → far edge | Anchor |
 |---|---|---|---|---|---|
 | 0 | `artifact_occlusion` | 0–100 | > 10.0 | 255 → 255 | sub-100 mm, treat as occlusion |
-| 1 | `extreme_near` | 100–200 | 10.0–5.0 | 255 → 255 | IMI <20 cm risk threshold |
-| 2 | `close_near` | 200–300 | 5.0–3.33 | 255 → 134 | Sydney Myopia Study; Gajjar 2022 |
-| 3 | `standard_near` | 300–400 | 3.33–2.5 | 134 → 82 | clinical near reference 33/40 cm |
-| 4 | `near_intermediate` | 400–600 | 2.5–1.67 | 82 → 41 | upper edge of Ostrin near band |
-| 5 | `intermediate` | 600–1000 | 1.67–1.0 | 41 → 17 | Ostrin intermediate band |
+| 1 | `extreme_near` | 100–200 | 10.0–5.0 | 255 → 234 | IMI <20 cm risk threshold |
+| 2 | `close_near` | 200–300 | 5.0–3.33 | 234 → 119 | Sydney Myopia Study; Gajjar 2022 |
+| 3 | `standard_near` | 300–400 | 3.33–2.5 | 119 → 74 | clinical near reference 33/40 cm |
+| 4 | `near_intermediate` | 400–600 | 2.5–1.67 | 74 → 38 | upper edge of Ostrin near band |
+| 5 | `intermediate` | 600–1000 | 1.67–1.0 | 38 → 17 | Ostrin intermediate band |
 | 6 | `room` | 1000–2000 | 1.0–0.5 | 17 → 10 | — |
 | 7 | `far` | 2000–∞ | < 0.5 | 10 | effective optical infinity |
 

@@ -76,16 +76,16 @@ min_raw(d) = clip(ceil(a · d^-k), floor_min_raw, 255)        d in mm
 
 `a` and `k` are not stored. They are fit at load time by least squares in log-log space through the bench **anchor points** in the config file. Anchors at exactly 0 or 255 are clipped by the byte encoding (the true requirement is unknown), so they are excluded from the fit rather than flattening its slope. `floor_min_raw` (currently 10) stops the far tail from falling below anything bench data supports; a pure power law would reach ~5 at 2000 mm. A fit that rises with distance (`k ≤ 0`) raises rather than loading — it means the anchors are wrong.
 
-Shipped curve (from the 2026-10 bench anchors: `a ≈ 2.44e6`, `k ≈ 1.72`, floor 10), summarised at the reporting bands for reference only:
+Shipped curve (2026-10 paper/phone bench anchors plus 2026-11 near-work anchors from iPad, Switch, laptop and picture book; `a ≈ 1.58e6`, `k ≈ 1.67`, floor 10), summarised at the reporting bands for reference only:
 
 | Band | Name | Distance (mm) | Vergence (D) | Min raw (SNR), near → far edge |
 |---|---|---|---|---|
 | 0 | `artifact_occlusion` | < 100 | > 10.0 | 255 → 255 |
-| 1 | `extreme_near` | 100–200 | 10.00–5.00 | 255 → 255 |
-| 2 | `close_near` | 200–300 | 5.00–3.33 | 255 → 134 |
-| 3 | `standard_near` | 300–400 | 3.33–2.50 | 134 → 82 |
-| 4 | `near_intermediate` | 400–600 | 2.50–1.67 | 82 → 41 |
-| 5 | `intermediate` | 600–1000 | 1.67–1.00 | 41 → 17 |
+| 1 | `extreme_near` | 100–200 | 10.00–5.00 | 255 → 234 |
+| 2 | `close_near` | 200–300 | 5.00–3.33 | 234 → 119 |
+| 3 | `standard_near` | 300–400 | 3.33–2.50 | 119 → 74 |
+| 4 | `near_intermediate` | 400–600 | 2.50–1.67 | 74 → 38 |
+| 5 | `intermediate` | 600–1000 | 1.67–1.00 | 38 → 17 |
 | 6 | `room` | 1000–2000 | 1.00–0.50 | 17 → 10 |
 | 7 | `far` | > 2000 | < 0.50 | 10 |
 
