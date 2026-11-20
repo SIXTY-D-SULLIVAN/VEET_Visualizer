@@ -532,7 +532,7 @@ class ThresholdsTab(QWidget):
         when = datetime.datetime.now().strftime('%H:%M:%S')
         self.source_label.setText(
             f"{prefix} {when} — confidence thresholds: {origin} — {tb.CONFIDENCE_THRESHOLDS_SOURCE}\n"
-            f"Gate v{tb.CONFIDENCE_GATE_VERSION}, {tb.CONF_BIN_MM:.0f} mm bins: {tb.CONFIDENCE_CURVE_DESCRIPTION}")
+            f"Gate v{tb.CONFIDENCE_GATE_VERSION}: {tb.CONFIDENCE_CURVE_DESCRIPTION}")
 
         headers = ["Band", "Name", "Distance (mm)", "Vergence (D)", "Min raw (SNR), near→far edge"]
         self.table.setColumnCount(len(headers))

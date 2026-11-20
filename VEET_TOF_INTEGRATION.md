@@ -50,7 +50,7 @@ Resolution, per zone per frame:
    - **Object 2 passes the stage-1 gate** → "rescued": object 2's `(z, conf)` becomes the resolved measurement.
    - **Object 2 is also nonzero-but-low-confidence** → ambiguous. Neither return can be trusted; the zone is excluded and counted (see `zone_yield`'s `ambiguous_dual_return_fraction`), not silently mis-binned.
 
-Object 2 is gated by the same 10 mm threshold curve as object 1 (§3.2), looked up at object 2's own distance — same sensor, same characterisation curve, no separate threshold.
+Object 2 is gated by the same threshold curve as object 1 (§3.2), looked up at object 2's own distance — same sensor, same characterisation curve, no separate threshold.
 
 **Encoding, not a second mask.** The ambiguous branch resolves to `conf_resolved = 0` paired with `z_resolved = z2` (always ≥ the floor in that branch). This guarantees the zone fails the ordinary stage-1 confidence check on its own, so `valid_mask`/`analysis_mask`/`dioptric_histogram`/`dioptric_dose`/`band_index`/`to_diopters` all keep working unchanged on the resolved array — no dual-return-aware branch needed anywhere downstream, and `analysis_mask` remains the sole reporting path (Invariant §6.2).
 
@@ -68,7 +68,7 @@ VEET2 firmware is fixed to linear confidence encoding (`logarithmic_confidence =
 
 Confidence required scales with measured distance — weak far returns are cheap and common, weak near returns are suspicious.
 
-**The threshold is a continuous curve on a 10 mm grid, not one value per reporting band** (`CONFIDENCE_GATE_VERSION = 3`: v2 introduced the curve, v3 added the weak-near-unbacked exclusion in §3.1). Each zone's own measured distance selects a 10 mm bin — bin *i* covers `[10 + 10i, 20 + 10i)` mm from `Z_FLOOR_MM` up to 2000 mm, plus one open-ended bin ≥ 2000 mm — and the bin's threshold is the curve evaluated at the bin's near edge (the most conservative value in the bin, since the curve falls with distance). The curve is:
+**The threshold is a continuous curve, not one value per reporting band** (`CONFIDENCE_GATE_VERSION = 4`: v2 introduced the curve on a 10 mm grid, v3 added the weak-near-unbacked exclusion in §3.1, v4 dropped the 10 mm grid). The curve is evaluated at each zone's own measured distance, clamped to `Z_FLOOR_MM`–2000 mm (anything ≥ 2000 mm gets the 2000 mm value). Because confidence is an integer, `conf ≥ ceil(a·d^-k)` is exactly `conf ≥ a·d^-k`. Dropping the grid (which used each bin's near-edge value) loosened the gate by at most 12 counts, at 250–260 mm; on session 25060544-4 it changed 0.28% of zone decisions and every band's hours by under 2%. The curve is:
 
 ```
 min_raw(d) = clip(ceil(a · d^-k), floor_min_raw, 255)        d in mm
@@ -82,10 +82,10 @@ Shipped curve (from the 2026-10 bench anchors: `a ≈ 2.44e6`, `k ≈ 1.72`, flo
 |---|---|---|---|---|
 | 0 | `artifact_occlusion` | < 100 | > 10.0 | 255 → 255 |
 | 1 | `extreme_near` | 100–200 | 10.00–5.00 | 255 → 255 |
-| 2 | `close_near` | 200–300 | 5.00–3.33 | 255 → 142 |
-| 3 | `standard_near` | 300–400 | 3.33–2.50 | 134 → 86 |
-| 4 | `near_intermediate` | 400–600 | 2.50–1.67 | 82 → 42 |
-| 5 | `intermediate` | 600–1000 | 1.67–1.00 | 41 → 18 |
+| 2 | `close_near` | 200–300 | 5.00–3.33 | 255 → 134 |
+| 3 | `standard_near` | 300–400 | 3.33–2.50 | 134 → 82 |
+| 4 | `near_intermediate` | 400–600 | 2.50–1.67 | 82 → 41 |
+| 5 | `intermediate` | 600–1000 | 1.67–1.00 | 41 → 17 |
 | 6 | `room` | 1000–2000 | 1.00–0.50 | 17 → 10 |
 | 7 | `far` | > 2000 | < 0.50 | 10 |
 
@@ -177,8 +177,8 @@ from veet_tof_bands import (
 |---|---|---|
 | `analysis_mask(z, c)` | bool `(...,8,8)` | **Primary.** Gate ∩ analysis field. All reporting derives from this. |
 | `valid_mask(z, c)` | bool `(...,8,8)` | Stage 1 only. Use when you need the gate independent of the field. |
-| `reload_confidence_thresholds(path=None)` | int `(200,)` | Re-read `CONFIDENCE_THRESHOLDS_PATH` (or `path`), re-fit, and rebuild the 10 mm gate curve in place — the lab-characterisation edit loop. Returns the new curve. See §3.2. |
-| `confidence_curve()` | `(bin_lo_mm, min_raw)` | The 10 mm curve currently in effect, for display/export. |
+| `reload_confidence_thresholds(path=None)` | int `(200,)` | Re-read `CONFIDENCE_THRESHOLDS_PATH` (or `path`), re-fit, and replace the gate curve in place — the lab-characterisation edit loop. Returns the new curve. See §3.2. |
+| `confidence_curve()` | `(distance_mm, min_raw)` | The curve currently in effect, sampled every 10 mm, for display/export. |
 | `band_min_raw_range(band)` | `(int, int)` | Threshold at a reporting band's near and far edge — display only. |
 | `fit_power_law(anchors, floor)` | `PowerLawFit` | The load-time fit, exposed so the bench produces exactly the curve a candidate JSON will load as. |
 | `resolve_dual_return(z1, c1, z2, c2)` | `(z, conf, ambiguous)` | **Stage 0, mandatory.** Folds object 1/object 2 into one `(z, conf)` pair; feed the result into `valid_mask`/`analysis_mask` exactly like a single-return pair. See §3.1. |
@@ -186,7 +186,7 @@ from veet_tof_bands import (
 | `dioptric_histogram(z, c, dt)` | float `(41,)` | Time-weighted, seconds per bin. Last element is overflow. |
 | `dioptric_dose(z, c, dt)` | float | Dioptre-hours. The distance analogue of lux-hours. |
 | `band_index(z)` | int `(...,8,8)` | Reporting band 0–7. |
-| `min_confidence(z)` | int `(...,8,8)` | Required raw confidence at each distance (10 mm curve lookup). |
+| `min_confidence(z)` | int `(...,8,8)` | Required raw confidence at each distance (continuous curve). |
 | `field_coverage_mm(z, field)` | `(float, float)` | Scene extent in mm at a distance. |
 | `zone_yield(z, c, ambiguous_mask=None)` | dict | **Diagnostic.** Per-stage yields including guard-band health; adds `ambiguous_dual_return_fraction` when `ambiguous_mask` (from `resolve_dual_return`) is passed. |
 | `confidence_to_snr(raw, enc)` | float, same shape | **Diagnostic.** Decode raw byte to SNR. Raises if encoding unknown. |
@@ -200,7 +200,7 @@ from veet_tof_bands import (
 
 Changing any of these silently invalidates comparisons against prior runs. Bump a version constant and re-run the full pipeline if you touch them.
 
-1. Band edges (mm/vergence geometry) and dioptric bin edges must stay coupled. Band geometry is not exposed for lab editing. The confidence gate is deliberately *not* tied to the bands: it is a separate 10 mm curve (§3.2), so tuning it never moves a reporting edge. `CONFIDENCE_GATE_VERSION` (currently 3: the 10 mm curve plus the weak-near-unbacked exclusion; 2 was the curve alone, 1 the per-band step gate) must be bumped if gate semantics change, and outputs from different gate versions must not be compared directly.
+1. Band edges (mm/vergence geometry) and dioptric bin edges must stay coupled. Band geometry is not exposed for lab editing. The confidence gate is deliberately *not* tied to the bands: it is a separate continuous curve (§3.2), so tuning it never moves a reporting edge. `CONFIDENCE_GATE_VERSION` (currently 4: the continuous curve plus the weak-near-unbacked exclusion; 3 was the same on a 10 mm grid, 2 the 10 mm curve alone, 1 the per-band step gate) must be bumped if gate semantics change, and outputs from different gate versions must not be compared directly.
 2. `CONFIDENCE_ENCODING` is fixed at `"linear"` — VEET2 firmware does not expose the logarithmic option, so no per-session assertion is needed.
 2. `analysis_mask` is the only path to reported measures. `resolve_dual_return` runs strictly upstream of stage 1 for every session; ambiguous zones are excluded via `conf_resolved = 0`, which stage 1 already rejects, not via a separate mask threaded through the pipeline.
 3. `spatial_corroboration` is single-pass. Adjacency is evaluated against the stage-1 mask, so pruning a zone never cascades into pruning its neighbour. Iterative erosion would be order-dependent — do not "improve" it into a loop.

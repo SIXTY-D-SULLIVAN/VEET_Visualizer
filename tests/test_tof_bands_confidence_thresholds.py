@@ -52,25 +52,43 @@ def test_loaded_curve_is_valid_bytes_and_non_increasing():
     assert np.all(np.diff(lut) <= 0)
 
 
-# --- 10 mm grid -------------------------------------------------------------
+# --- Continuous lookup ------------------------------------------------------
 
-def test_grid_spans_floor_to_2000mm_in_10mm_bins():
+def test_display_grid_spans_floor_to_2000mm_in_10mm_steps():
     lo = tb.CONF_BIN_LO_MM
     assert lo[0] == tb.Z_FLOOR_MM and lo[-1] == tb.CONF_LUT_MAX_MM
     assert np.all(np.diff(lo) == 10.0)
 
 
-def test_lookup_uses_bin_near_edge(tmp_path):
+def test_lookup_is_continuous_not_binned(tmp_path):
     tb.reload_confidence_thresholds(_write(tmp_path, _v2(_EXACT_ANCHORS, floor=0)))
     fit = tb.CONFIDENCE_FIT
-    # Anywhere inside [300, 310) gets the value at 300; 310 starts the next bin.
-    at_300 = int(fit.evaluate(300.0))
-    assert tb.min_confidence([300.0, 305.0, 309.99]).tolist() == [at_300] * 3
-    assert tb.min_confidence([310.0])[0] == int(fit.evaluate(310.0))
-    assert at_300 > int(fit.evaluate(310.0))
+    z = np.array([300.0, 305.0, 309.99, 310.0])
+    np.testing.assert_array_equal(tb.min_confidence(z), fit.evaluate(z))
+    # Within what used to be one 10 mm bin the threshold now keeps falling.
+    assert tb.min_confidence([300.0])[0] > tb.min_confidence([309.0])[0]
 
 
-def test_beyond_2000mm_uses_final_bin_and_no_return_resolves_far(tmp_path):
+def test_gate_is_exact_against_unrounded_curve(tmp_path):
+    tb.reload_confidence_thresholds(_write(tmp_path, _v2(_EXACT_ANCHORS, floor=0)))
+    fit = tb.CONFIDENCE_FIT
+    z = np.linspace(250.0, 1500.0, 2001)
+    exact = fit.a * z ** -fit.k
+    for c in (20, 50, 120):
+        np.testing.assert_array_equal(tb.valid_mask(z, np.full_like(z, c)), c >= exact)
+
+
+def test_legacy_step_config_still_steps_at_band_edges(tmp_path):
+    tb.reload_confidence_thresholds(_write(tmp_path, {"min_raw_by_band": {}}))
+    assert tb.CONFIDENCE_FIT is None
+    for band in tb.BANDS[1:]:
+        lo = max(band.z_min_mm, tb.Z_FLOOR_MM)
+        hi = band.z_max_mm - 0.5 if np.isfinite(band.z_max_mm) else lo + 1000.0
+        vals = tb.min_confidence([lo, hi]).tolist()
+        assert vals[0] == vals[1] == tb._DEFAULT_MIN_RAW_BY_NAME[band.name]
+
+
+def test_beyond_2000mm_uses_2000mm_value_and_no_return_resolves_far(tmp_path):
     tb.reload_confidence_thresholds(_write(tmp_path, _v2(_EXACT_ANCHORS, floor=0)))
     far = tb.min_confidence([2000.0])[0]
     assert tb.min_confidence([2500.0, 10_000.0, np.inf, np.nan]).tolist() == [far] * 4

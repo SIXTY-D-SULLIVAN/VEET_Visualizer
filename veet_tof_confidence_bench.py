@@ -683,8 +683,13 @@ def _flag_marker(flag: str) -> str:
 
 
 def _plot_live_curve(ax) -> None:
-    """The 10 mm threshold curve currently loaded in veet_tof_bands."""
-    lo, lut = tb.confidence_curve()
+    """The threshold curve currently loaded in veet_tof_bands."""
+    if tb.CONFIDENCE_FIT is not None:
+        xs = np.geomspace(max(_PLOT_X_MM[0], tb.Z_FLOOR_MM), _PLOT_X_MM[1], 400)
+        ax.plot(xs, tb.min_confidence(xs), color="black", linewidth=1.5,
+                label="current threshold curve")
+        return
+    lo, lut = tb.confidence_curve()  # legacy per-band step gate
     xs = np.append(lo, _PLOT_X_MM[1])
     ax.step(xs, np.append(lut, lut[-1]), where="post", color="black", linewidth=1.5,
             label="current threshold curve")
@@ -872,9 +877,9 @@ def write_points_csv(points: list[PointResult], out_path: str) -> None:
 
 
 def write_curve_csv(curves: dict, out_path: str) -> None:
-    """One row per 10 mm gate bin: current threshold and each mode's fit."""
+    """One row per 10 mm sample of the curve: current threshold and each mode's fit."""
     lo, current = tb.confidence_curve()
-    header = ["bin_lo_mm", "current_min_raw"] + [f"{mode}_fit_min_raw" for mode in ROUND_MODES]
+    header = ["distance_mm", "current_min_raw"] + [f"{mode}_fit_min_raw" for mode in ROUND_MODES]
     fitted = {mode: (c["fit"].evaluate(lo) if c["fit"] is not None else None) for mode, c in curves.items()}
     lines = [",".join(header)]
     for i, z in enumerate(lo):
@@ -938,7 +943,7 @@ def write_report_md(
     include_wall = any(c["include_wall"] for c in curves.values())
     any_fit = next((c["fit"] for c in curves.values() if c["fit"] is not None), None)
     floor_text = f"floored at {any_fit.floor_min_raw}" if any_fit else "floored"
-    lines.append("## Fitted threshold curve (10 mm gate)\n")
+    lines.append("## Fitted threshold curve\n")
     lines.append(
         "Each point's recommendation is an anchor at its measured distance"
         + (" (Object 1 for that mode, plus the Object 2/wall recommendation at the wall's distance)"
@@ -961,7 +966,7 @@ def write_report_md(
 
     lines.append("### Curve at reporting-band near edges (reference only)\n")
     lines.append("The gate no longer has one value per band; these are the curves sampled at "
-                  "each band's near edge for comparison. Full 10 mm table: `threshold_curve.csv`.\n")
+                  "each band's near edge for comparison. Curves sampled every 10 mm: `threshold_curve.csv`.\n")
     lines.append("| Band | Near edge (mm) | Current | Floor fit | Nearest fit | Ceil fit |")
     lines.append("|---|---|---|---|---|---|")
     for b in tb.BANDS:

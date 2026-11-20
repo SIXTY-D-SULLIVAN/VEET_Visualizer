@@ -2,8 +2,8 @@
 
 Two distance-indexed tables, deliberately decoupled:
   1. the per-zone confidence gate (is this return trustworthy?) -- a
-     continuous threshold curve sampled on a 10 mm grid, looked up from each
-     zone's own measured distance (``min_confidence``)
+     continuous threshold curve evaluated at each zone's own measured
+     distance (``min_confidence``)
   2. the dioptric reporting bands (which literature-anchored bin is it?) --
      the 8 ``BANDS``, coupled to the dioptric histogram
 
@@ -214,7 +214,7 @@ class Band:
     """One dioptric reporting band (geometry + literature anchor).
 
     Bands no longer carry a confidence threshold: the stage-1 gate uses the
-    continuous 10 mm threshold curve (see ``min_confidence``), which is
+    continuous threshold curve (see ``min_confidence``), which is
     deliberately decoupled from the reporting-band edges. Use
     ``band_min_raw_range(band)`` to see what the curve does inside a band.
     """
@@ -265,19 +265,24 @@ def band_index(z_mm: np.ndarray) -> np.ndarray:
     return np.searchsorted(_EDGES, _resolve_no_return(z_mm), side="right")
 
 
-# --- Confidence gate: continuous 10 mm threshold curve -----------------------
+# --- Confidence gate: continuous threshold curve ------------------------------
 #
-# The stage-1 threshold is looked up from each zone's own measured distance
-# on a 10 mm grid: bin i covers [CONF_BIN_LO_MM[i], CONF_BIN_LO_MM[i] + 10),
-# from Z_FLOOR_MM up to CONF_LUT_MAX_MM; the final bin is open-ended
-# [CONF_LUT_MAX_MM, inf). Each bin's threshold is the curve evaluated at the
-# bin's NEAR edge -- the curve falls with distance, so that's the most
-# conservative value within the bin.
+# The stage-1 threshold is the fitted curve evaluated at each zone's own
+# measured distance -- no binning. Distances are clamped to
+# [Z_FLOOR_MM, CONF_LUT_MAX_MM] first, so everything at or beyond 2000 mm
+# (including the no-return sentinel and NaN) gets the 2000 mm value, which
+# is the floor for any realistic fit.
+#
+# CONF_BIN_LO_MM / the LUT remain for two jobs only: a 10 mm sampling of the
+# curve for display and export (``confidence_curve``), and the legacy
+# per-band step gate (format v1 / no config), whose band edges are all
+# multiples of 10 mm so the step LUT reproduces it exactly.
 #
 # Bumped whenever gate semantics change, so outputs from different gates are
 # never silently compared. 1 = per-band step gate; 2 = 10 mm curve;
-# 3 = 10 mm curve + weak-near-unbacked exclusion in resolve_dual_return.
-CONFIDENCE_GATE_VERSION = 3
+# 3 = 10 mm curve + weak-near-unbacked exclusion in resolve_dual_return;
+# 4 = continuous curve (no 10 mm binning) + weak-near-unbacked exclusion.
+CONFIDENCE_GATE_VERSION = 4
 
 CONF_BIN_MM = 10.0
 CONF_LUT_MAX_MM = 2000.0
@@ -411,7 +416,7 @@ def _parse_v1(data: dict, target) -> np.ndarray:
 
 
 def _parse_v2(data: dict, target) -> "tuple[PowerLawFit, float]":
-    """Curve config: anchors + rule, expanded to the 10 mm LUT at load."""
+    """Curve config: anchors + rule, fit at load."""
     version = data.get("format_version", 2)
     if version != 2:
         raise ValueError(f"{target}: unsupported format_version {version!r} (expected 2).")
@@ -447,7 +452,7 @@ def _parse_v2(data: dict, target) -> "tuple[PowerLawFit, float]":
 
 
 def _load_confidence_lut(path: "str | Path | None" = None) -> np.ndarray:
-    """Build the 10 mm threshold LUT from the config file.
+    """Load the gate config; returns its 10 mm LUT (display / step gate).
 
     Format v2 (has "anchors"): power-law fit through the anchors, floored.
     Format v1 (per-band map): legacy step curve, unlisted bands default.
@@ -494,14 +499,15 @@ _CONF_LUT: np.ndarray = _load_confidence_lut()
 
 
 def reload_confidence_thresholds(path: "str | Path | None" = None) -> np.ndarray:
-    """Re-read the confidence-threshold config and rebuild the 10 mm LUT in
+    """Re-read the confidence-threshold config and re-fit the curve in
     place, without restarting the process -- the expected workflow while lab
     characterisation is ongoing: edit CONFIDENCE_THRESHOLDS_PATH, then call
-    this. Returns the new LUT (aligned with ``CONF_BIN_LO_MM``).
+    this. Returns the new curve sampled on the 10 mm display grid
+    (aligned with ``CONF_BIN_LO_MM``).
 
     All gating functions (``valid_mask``, ``min_confidence``,
-    ``resolve_dual_return``, ...) read the module-level ``_CONF_LUT`` at call
-    time, so they pick up the reload automatically. On a malformed file this
+    ``resolve_dual_return``, ...) read the module-level ``CONFIDENCE_FIT`` /
+    ``_CONF_LUT`` at call time, so they pick up the reload automatically. On a malformed file this
     raises and the previously loaded curve stays in effect.
     """
     global _CONF_LUT
@@ -510,22 +516,29 @@ def reload_confidence_thresholds(path: "str | Path | None" = None) -> np.ndarray
 
 
 def confidence_curve() -> tuple[np.ndarray, np.ndarray]:
-    """(bin_lo_mm, min_raw) for the curve currently in effect -- for display."""
+    """(distance_mm, min_raw): the curve in effect sampled every 10 mm, for
+    display/export. Gating itself evaluates the curve continuously."""
     return CONF_BIN_LO_MM.copy(), _CONF_LUT.copy()
 
 
 def band_min_raw_range(band: Band) -> tuple[int, int]:
     """(near-edge, far-edge) threshold the curve applies inside a reporting band."""
     lo = max(band.z_min_mm, Z_FLOOR_MM)
-    hi = min(band.z_max_mm, CONF_LUT_MAX_MM + CONF_BIN_MM) - CONF_BIN_MM * 1e-3
+    hi = min(band.z_max_mm, CONF_LUT_MAX_MM + CONF_BIN_MM) - 1e-6
     vals = min_confidence(np.array([lo, max(lo, hi)]))
     return int(vals[0]), int(vals[1])
 
 
 def min_confidence(z_mm: np.ndarray) -> np.ndarray:
-    """Minimum raw confidence (0-255) required at each measured distance,
-    looked up on the 10 mm grid (sub-floor readings resolve to far first)."""
+    """Minimum raw confidence (0-255) required at each measured distance
+    (sub-floor readings resolve to far first). With a fitted curve this is
+    ``CONFIDENCE_FIT`` evaluated at the distance itself; ``ceil`` in the fit
+    makes ``conf >= min_confidence(z)`` exactly ``conf >= a*z**-k`` for
+    integer confidence. Legacy step configs use the per-band LUT."""
     z = _resolve_no_return(z_mm)
+    if CONFIDENCE_FIT is not None:
+        z = np.where(np.isnan(z), CONF_LUT_MAX_MM, z)
+        return CONFIDENCE_FIT.evaluate(np.clip(z, Z_FLOOR_MM, CONF_LUT_MAX_MM))
     idx = np.searchsorted(CONF_BIN_LO_MM, z, side="right") - 1
     return _CONF_LUT[np.clip(idx, 0, len(CONF_BIN_LO_MM) - 1)]
 
@@ -590,7 +603,7 @@ def resolve_dual_return(
       callers can count these zones (see ``zone_yield``'s ambiguous_mask
       parameter) -- it plays no role in gating.
 
-    Object 2 is gated by the same 10 mm threshold curve as object 1 (same
+    Object 2 is gated by the same threshold curve as object 1 (same
     sensor, same characterization curve), looked up at object 2's own
     distance.
 
