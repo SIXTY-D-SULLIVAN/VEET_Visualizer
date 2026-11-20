@@ -56,6 +56,16 @@ PRESETS = {
         include="ipad", exclude="30deg", w_mm=240.0, h_mm=170.0, tol_frac=0.15),
     "Switch (handheld console) -- flat / normal (0 deg)": dict(
         include="switch", exclude="30deg", w_mm=240.0, h_mm=100.0, tol_frac=0.15),
+    # Glossy children's picture book, open spread (~43 x 23 cm).
+    "Children's book (glossy, open) -- flat / normal (0 deg)": dict(
+        include="book", exclude="30deg", w_mm=430.0, h_mm=230.0, tol_frac=0.15),
+    # Live adult hand, loosely open, palm to sensor, fingers up. Typical
+    # dimensions (not measured). Keep tol at 0.15: wider pulls the forearm
+    # (~130-160 mm behind the hand) into the phantom set.
+    # Validation object: checked against the gate, never used as anchors.
+    "Adult hand (open, palm to sensor) -- validation only": dict(
+        include="hand", exclude="30deg", w_mm=120.0, h_mm=190.0, tol_frac=0.15,
+        validate_only=True),
     # Screen only (keyboard is below/nearer and not part of the footprint);
     # wider tolerance because the screen sits at its hinge angle, not square-on.
     "Laptop screen -- at hinge angle": dict(
@@ -207,7 +217,22 @@ class MainWindow(QMainWindow):
         self.center_window_spin = QSpinBox()
         self.center_window_spin.setRange(1, 8)
         self.center_window_spin.setValue(2)
-        adv_form.addRow("Center window (zones):", self.center_window_spin)
+        adv_form.addRow("Seed window (zones):", self.center_window_spin)
+
+        self.auto_locate_check = QCheckBox("Locate the object in the grid (not assumed centred)")
+        self.auto_locate_check.setChecked(True)
+        adv_form.addRow(self.auto_locate_check)
+
+        self.guard_spin = QSpinBox()
+        self.guard_spin.setRange(0, 3)
+        self.guard_spin.setValue(1)
+        self.guard_spin.setToolTip("Zones on the footprint boundary are only partly covered; "
+                                   "this many rings are left out of the phantom and wall-leak sets")
+        adv_form.addRow("Boundary guard (zones):", self.guard_spin)
+
+        self.validate_only_check = QCheckBox(
+            "Validation only (check the gate in effect; no fit, no candidate JSONs)")
+        adv_form.addRow(self.validate_only_check)
 
         self.obj_pct_spin = QDoubleSpinBox()
         self.obj_pct_spin.setRange(0.0, 100.0)
@@ -311,6 +336,7 @@ class MainWindow(QMainWindow):
         self.w_spin.setValue(preset["w_mm"])
         self.h_spin.setValue(preset["h_mm"])
         self.tol_frac_spin.setValue(preset["tol_frac"])
+        self.validate_only_check.setChecked(preset.get("validate_only", False))
         if name != "Custom...":
             self.label_edit.setText(name.replace(" --", ","))
 
@@ -364,6 +390,9 @@ class MainWindow(QMainWindow):
             include_wall_anchors=self.wall_anchors_check.isChecked(),
             thresholds_json=self.thresholds_edit.text().strip() or None,
             out_dir=self.out_dir_edit.text().strip() if self.custom_out_check.isChecked() else None,
+            auto_locate=self.auto_locate_check.isChecked(),
+            guard_zones=self.guard_spin.value(),
+            validate_only=self.validate_only_check.isChecked(),
         )
 
         self.log_edit.clear()
@@ -395,11 +424,16 @@ class MainWindow(QMainWindow):
         fits = "\n".join(
             f"  {mode}: " + (c["fit"].describe() if c["fit"] else f"no fit -- {c['error']}")
             for mode, c in result["curves"].items())
-        self.result_label.setText(
-            f"Analyzed {n_points} of {result['n_files']} distance points.\n"
-            f"Fitted curves (candidate JSONs in output folder):\n{fits}\n"
-            f"Output folder: {result['out_dir']}"
-        )
+        if result.get("validate_only"):
+            self.result_label.setText(
+                f"Validated {n_points} of {result['n_files']} distance points against the "
+                f"gate in effect (no fit, no candidate JSONs).\n"
+                f"Output folder: {result['out_dir']}")
+        else:
+            self.result_label.setText(
+                f"Analyzed {n_points} of {result['n_files']} distance points.\n"
+                f"Fitted curves (candidate JSONs in output folder):\n{fits}\n"
+                f"Output folder: {result['out_dir']}")
         pix = QPixmap(result["summary_png"])
         if not pix.isNull():
             self.summary_image.setPixmap(pix.scaledToWidth(800, Qt.SmoothTransformation))

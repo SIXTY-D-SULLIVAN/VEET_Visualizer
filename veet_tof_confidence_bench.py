@@ -12,7 +12,9 @@ script:
      estimate_object_distance for why).
   3. Works out geometrically how many of the 64 zones the object should
      occupy at that distance (three rounding conventions: floor/nearest/
-     ceil -- see compute_footprint).
+     ceil -- see compute_footprint), and places that block where the
+     object actually is in the grid (locate_block), since the bench setup
+     doesn't keep the target centred.
   4. Renders a VEET_TOF_Viewer.py-style spatial view per distance point,
      with the three candidate footprints overlaid.
   5. Derives a recommended minimum raw confidence per point per rounding
@@ -21,7 +23,7 @@ script:
   6. Treats every per-point recommendation (Object 1 per rounding mode,
      plus the Object 2 / wall recommendation) as an anchor at its measured
      distance, fits the same floored power law veet_tof_bands.py uses for
-     its 10 mm gate curve (tb.fit_power_law), reports it next to the
+     its gate curve (tb.fit_power_law), reports it next to the
      currently-loaded curve, and writes one candidate v2 thresholds JSON
      per rounding mode.
 
@@ -40,7 +42,8 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, field
 
 import matplotlib
 matplotlib.use("Agg")
@@ -206,6 +209,50 @@ def _centered_block(n: int, grid: int = 8) -> tuple[int, int]:
     return lo, lo + n
 
 
+def _block_mask(row_lo: int, n_rows: int, col_lo: int, n_cols: int) -> np.ndarray:
+    mask = np.zeros(tb.GRID_SHAPE, dtype=bool)
+    mask[row_lo:row_lo + n_rows, col_lo:col_lo + n_cols] = True
+    return mask
+
+
+def locate_block(score: np.ndarray, n_rows: int, n_cols: int) -> tuple[int, int]:
+    """Top-left (row_lo, col_lo) of the n_rows x n_cols block with the largest
+    summed `score` (an (8,8) per-zone evidence map). Used to place the
+    object's footprint where the object actually is, because on the bench
+    the target is not reliably centred. Ties (e.g. a flat map) go to the
+    placement closest to the grid centre, so the old centred behaviour is
+    what you get when the data cannot tell placements apart.
+    """
+    grid_r, grid_c = tb.GRID_SHAPE
+    n_rows = int(np.clip(n_rows, 1, grid_r))
+    n_cols = int(np.clip(n_cols, 1, grid_c))
+    score = np.nan_to_num(np.asarray(score, dtype=float), nan=0.0)
+    centre_r, centre_c = (grid_r - n_rows) / 2.0, (grid_c - n_cols) / 2.0
+    best_key, best = None, (0, 0)
+    for r in range(grid_r - n_rows + 1):
+        for c in range(grid_c - n_cols + 1):
+            total = float(score[r:r + n_rows, c:c + n_cols].sum())
+            # Round the sum so float noise can't beat the centre tie-break.
+            key = (round(total, 6), -((r - centre_r) ** 2 + (c - centre_c) ** 2))
+            if best_key is None or key > best_key:
+                best_key, best = key, (r, c)
+    return best
+
+
+def shift_mask(mask: np.ndarray, rings: int, grow: bool) -> np.ndarray:
+    """Grow (8-neighbour dilation) or shrink (erosion) `mask` by `rings` zones.
+    Erosion treats off-grid zones as inside the mask, so an object that runs
+    off the edge of the grid keeps its edge zones (they are not boundary
+    zones, the object continues beyond them)."""
+    out = mask.copy()
+    for _ in range(max(0, int(rings))):
+        padded = np.pad(out, 1, constant_values=not grow)
+        stack = [padded[1 + dr:1 + dr + out.shape[0], 1 + dc:1 + dc + out.shape[1]]
+                 for dr in (-1, 0, 1) for dc in (-1, 0, 1)]
+        out = np.logical_or.reduce(stack) if grow else np.logical_and.reduce(stack)
+    return out
+
+
 def estimate_distance_in_mask(
     dist_arr: np.ndarray, mask: np.ndarray
 ) -> tuple["float | None", float, int]:
@@ -224,29 +271,56 @@ def estimate_distance_in_mask(
 
 
 def estimate_object_distance(
-    dist1: np.ndarray, center_window: int = 2
+    dist1: np.ndarray, center_window: int = 2, conf1: "np.ndarray | None" = None,
 ) -> tuple["float | None", float, int]:
     """First-pass measured distance to Object 1, from raw dist1 only.
 
     Deliberately does NOT use tb.resolve_dual_return / tb.valid_mask: both
     depend on tb.min_confidence(z), i.e. on the very thresholds this bench
     test exists to re-derive. Using them here would make the new
-    thresholds partly a function of the old (possibly wrong) ones. The
-    geometric center zones are the only "which zones are the object"
-    signal available before any threshold exists, so that's what's used.
+    thresholds partly a function of the old (possibly wrong) ones.
+
+    The seed is a center_window x center_window block. With `conf1` given
+    it is placed where the summed per-zone median raw confidence is
+    highest (the target is the brightest thing in view, and this uses no
+    threshold); without it, it is the geometric centre block.
     """
-    row_lo, row_hi = _centered_block(center_window)
-    col_lo, col_hi = _centered_block(center_window)
-    mask = np.zeros(tb.GRID_SHAPE, dtype=bool)
-    mask[row_lo:row_hi, col_lo:col_hi] = True
+    if conf1 is not None:
+        row_lo, col_lo = locate_block(np.nanmedian(conf1, axis=0), center_window, center_window)
+        mask = _block_mask(row_lo, center_window, col_lo, center_window)
+    else:
+        row_lo, row_hi = _centered_block(center_window)
+        col_lo, col_hi = _centered_block(center_window)
+        mask = np.zeros(tb.GRID_SHAPE, dtype=bool)
+        mask[row_lo:row_hi, col_lo:col_hi] = True
     return estimate_distance_in_mask(dist1, mask)
 
 
+def footprint_evidence(
+    conf1: np.ndarray, dist1: np.ndarray, z_hat: float, tol_frac: float
+) -> np.ndarray:
+    """(8,8) per-zone evidence that the object is in that zone: median raw
+    Object-1 confidence over the frames whose dist1 is within tolerance of
+    z_hat (0 if none). Gating on distance stops a bright wall pulling the
+    footprint; using confidence (not a hit count) stops the weak
+    object-distance ghost seen in background zones pulling it either."""
+    tol = max(tol_frac * z_hat, 20.0)
+    near = np.isfinite(dist1) & (np.abs(dist1 - z_hat) <= tol) & np.isfinite(conf1)
+    masked = np.where(near, conf1, np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)  # all-NaN zones
+        ev = np.nanmedian(masked, axis=0)
+    return np.nan_to_num(ev, nan=0.0)
+
+
 def compute_footprint(
-    z_hat: float, obj_w_mm: float, obj_h_mm: float, mode: str
+    z_hat: float, obj_w_mm: float, obj_h_mm: float, mode: str,
+    evidence: "np.ndarray | None" = None,
 ) -> dict:
     """Geometric footprint (rows x cols) of the object at distance z_hat,
-    for one of the three rounding conventions."""
+    for one of the three rounding conventions. The size always comes from
+    geometry; the placement comes from `evidence` (see footprint_evidence /
+    locate_block) when given, otherwise the block is centred."""
     if mode not in _ROUND_FUNCS:
         raise ValueError(f"Unknown rounding mode: {mode}")
     round_fn = _ROUND_FUNCS[mode]
@@ -260,14 +334,17 @@ def compute_footprint(
 
     n_rows = int(np.clip(round_fn(raw_rows), 1, 8))
     n_cols = int(np.clip(round_fn(raw_cols), 1, 8))
-    row_lo, row_hi = _centered_block(n_rows)
-    col_lo, col_hi = _centered_block(n_cols)
+    if evidence is not None:
+        row_lo, col_lo = locate_block(evidence, n_rows, n_cols)
+        row_hi, col_hi = row_lo + n_rows, col_lo + n_cols
+    else:
+        row_lo, row_hi = _centered_block(n_rows)
+        col_lo, col_hi = _centered_block(n_cols)
 
-    mask = np.zeros(tb.GRID_SHAPE, dtype=bool)
-    mask[row_lo:row_hi, col_lo:col_hi] = True
+    mask = _block_mask(row_lo, row_hi - row_lo, col_lo, col_hi - col_lo)
 
     return {
-        "mask": mask, "n_rows": n_rows, "n_cols": n_cols,
+        "mask": mask, "n_rows": n_rows, "n_cols": n_cols, "located": evidence is not None,
         "row_lo": row_lo, "row_hi": row_hi, "col_lo": col_lo, "col_hi": col_hi,
         "mm_per_zone_row": mm_per_zone_row, "mm_per_zone_col": mm_per_zone_col,
     }
@@ -355,16 +432,26 @@ class PointResult:
     band2_name: str
     current2_min_raw: "int | None"
     rec2: dict
+    # Gate check against the thresholds in effect -- see gate_validation.
+    validation: dict = field(default_factory=dict)
 
 
 def analyze_point(
     path: str, obj_w_mm: float, obj_h_mm: float, center_window: int,
     p_obj: float, p_phantom: float, tol_frac: float,
+    auto_locate: bool = True, guard_zones: int = 1,
 ) -> PointResult:
+    """auto_locate: place the seed block and footprints where the object is
+    (see locate_block) instead of assuming it is centred.
+    guard_zones: rings of zones around the footprint boundary treated as
+    ambiguous (the object only partly covers them) -- dropped from the
+    Object-1 phantom set (outside the footprint) and from the wall leak set
+    (inside it). 0 restores the old behaviour."""
     nominal_mm = parse_nominal_mm(path)
     data = load_tof_csv(path)
 
-    z_hat, mad, n_center = estimate_object_distance(data.dist1, center_window)
+    z_hat, mad, n_center = estimate_object_distance(
+        data.dist1, center_window, data.conf1 if auto_locate else None)
 
     footprints: dict = {}
     recs: dict = {}
@@ -377,10 +464,12 @@ def analyze_point(
         band_name = tb.BANDS[band_idx].name
         current_min_raw = int(tb.min_confidence(np.array([z_hat]))[0])
 
+        evidence = footprint_evidence(data.conf1, data.dist1, z_hat, tol_frac) \
+            if auto_locate else None
         for mode in ROUND_MODES:
-            fp = compute_footprint(z_hat, obj_w_mm, obj_h_mm, mode)
+            fp = compute_footprint(z_hat, obj_w_mm, obj_h_mm, mode, evidence)
             object_samples = zone_conf_samples(data.conf1, data.dist1, fp["mask"], z_hat, tol_frac)
-            phantom_mask = tb.ANALYSIS_FIELD & ~fp["mask"]
+            phantom_mask = tb.ANALYSIS_FIELD & ~shift_mask(fp["mask"], guard_zones, grow=True)
             phantom_samples = zone_conf_samples(data.conf1, data.dist1, phantom_mask, z_hat, tol_frac)
             rec = recommend_threshold(object_samples, phantom_samples, p_obj, p_phantom)
             footprints[mode] = fp
@@ -416,7 +505,7 @@ def analyze_point(
     fp1 = footprints.get(_WALL_PARTITION_MODE)
     if fp1 is not None:
         wall_mask = tb.ANALYSIS_FIELD & ~fp1["mask"]
-        occluded_mask = fp1["mask"]
+        occluded_mask = shift_mask(fp1["mask"], guard_zones, grow=False)
         z_hat2, mad2, _n_wall = estimate_distance_in_mask(data.dist2, wall_mask)
         if z_hat2 is not None:
             measured2_mm = z_hat2
@@ -449,7 +538,126 @@ def analyze_point(
         wall_mask=wall_mask, measured2_mm=measured2_mm, mad2_mm=mad2,
         band2_idx=band2_idx, band2_name=band2_name, current2_min_raw=current2_min_raw,
         rec2=rec2,
+        validation=gate_validation(data, z_hat, footprints, tol_frac, guard_zones),
     )
+
+
+# --- Gate validation -------------------------------------------------------
+
+VALIDATION_FOOTPRINT_MODE = "floor"  # most conservative: zones the object surely covers
+
+
+def gate_validation(
+    data: TofFrameData, z_hat: "float | None", footprints: dict, tol_frac: float,
+    guard_zones: int,
+) -> dict:
+    """How the thresholds currently in effect (tb.min_confidence -- load a
+    candidate with --thresholds-json to test it) treat this point, for
+    objects used as validation rather than as anchors (e.g. a live hand,
+    whose ragged edge and motion make its footprint p10 meaningless).
+
+    object_pass: fraction of Object-1 samples in the floor footprint, at the
+        object's distance, that pass the gate (higher is better).
+    zones_kept: fraction of floor-footprint zones whose median frame passes.
+    background_reject: fraction of background samples at the object's
+        distance (outside the nearest footprint plus guard ring) that fail
+        the gate (higher is better -- these are ghosts).
+    """
+    out = {"object_pass": None, "zones_kept": None, "n_object": 0,
+           "background_reject": None, "n_background": 0}
+    fp = footprints.get(VALIDATION_FOOTPRINT_MODE)
+    fp_bg = footprints.get(_WALL_PARTITION_MODE)
+    if z_hat is None or fp is None:
+        return out
+    tol = max(tol_frac * z_hat, 20.0)
+    near = np.isfinite(data.dist1) & np.isfinite(data.conf1) & (np.abs(data.dist1 - z_hat) <= tol)
+    passed = data.conf1 >= tb.min_confidence(np.nan_to_num(data.dist1, nan=0.0))
+
+    obj = near & fp["mask"][None]
+    if obj.any():
+        out["n_object"] = int(obj.sum())
+        out["object_pass"] = float(passed[obj].mean())
+        zone_pass = []
+        for r, c in zip(*np.nonzero(fp["mask"])):
+            sel = obj[:, r, c]
+            if sel.any():
+                zone_pass.append(np.median(passed[sel, r, c]) >= 0.5)
+        out["zones_kept"] = float(np.mean(zone_pass)) if zone_pass else None
+
+    if fp_bg is not None:
+        bg_mask = tb.ANALYSIS_FIELD & ~shift_mask(fp_bg["mask"], guard_zones, grow=True)
+        bg = near & bg_mask[None]
+        if bg.any():
+            out["n_background"] = int(bg.sum())
+            out["background_reject"] = float((~passed[bg]).mean())
+    return out
+
+
+def write_validation_outputs(points: list[PointResult], out_dir: str, object_label: str) -> tuple[str, str]:
+    csv_path = os.path.join(out_dir, "validation_points.csv")
+    md_path = os.path.join(out_dir, "validation_report.md")
+    fmt = lambda v: "" if v is None else f"{v:.3f}"  # noqa: E731
+    lines = ["file,nominal_mm,measured_mm,current_min_raw,n_object,object_pass,zones_kept,"
+             "n_background,background_reject"]
+    md = [f"# {object_label} -- gate validation\n",
+          f"Thresholds: `{tb.CONFIDENCE_THRESHOLDS_SOURCE}` "
+          f"(gate v{tb.CONFIDENCE_GATE_VERSION}: {tb.CONFIDENCE_CURVE_DESCRIPTION})\n",
+          "Validation only: these points are not anchors. Object = Object-1 samples in the "
+          f"`{VALIDATION_FOOTPRINT_MODE}` footprint at the object's distance; background = "
+          "samples at the object's distance outside the footprint and its guard ring.\n",
+          "| File | Measured mm | Gate | Object pass | Zones kept | Background reject |",
+          "|---|---|---|---|---|---|"]
+    pct = lambda v: "n/a" if v is None else f"{100 * v:.0f}%"  # noqa: E731
+    for p in points:
+        v = p.validation
+        lines.append(",".join([
+            p.file, f"{p.nominal_mm:.0f}", "" if p.measured_mm is None else f"{p.measured_mm:.1f}",
+            "" if p.current_min_raw is None else str(p.current_min_raw),
+            str(v.get("n_object", 0)), fmt(v.get("object_pass")), fmt(v.get("zones_kept")),
+            str(v.get("n_background", 0)), fmt(v.get("background_reject"))]))
+        md.append(f"| {p.file} | {'n/a' if p.measured_mm is None else f'{p.measured_mm:.0f}'} | "
+                  f"{'' if p.current_min_raw is None else p.current_min_raw} | "
+                  f"{pct(v.get('object_pass'))} | {pct(v.get('zones_kept'))} | "
+                  f"{pct(v.get('background_reject'))} |")
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        f.write("\n".join(lines) + "\n")
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(md) + "\n")
+    return csv_path, md_path
+
+
+def render_validation_png(points: list[PointResult], out_path: str, object_label: str) -> None:
+    fig = Figure(figsize=(11, 5))
+    ax = fig.subplots(1, 1)
+    for key, label, color, marker in (
+            ("object_pass", "object samples passing gate", "#2a7ab9", "o"),
+            ("zones_kept", "object zones kept (median frame)", "#5aa469", "s"),
+            ("background_reject", "background ghosts rejected", "#c0504d", "^")):
+        xy = [(p.measured_mm, 100 * p.validation[key]) for p in points
+              if p.measured_mm is not None and p.validation.get(key) is not None]
+        if xy:
+            ax.plot(*zip(*sorted(xy)), color=color, marker=marker, linewidth=1.2, label=label)
+    ax.set_ylim(0, 105)
+    ax.set_xlabel(f"Measured distance to {object_label} [mm]")
+    ax.set_ylabel("%")
+    ax.set_title(f"{object_label}: gate validation (v{tb.CONFIDENCE_GATE_VERSION}, "
+                 f"{os.path.basename(tb.CONFIDENCE_THRESHOLDS_SOURCE)})")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower right", fontsize=8)
+    fig.tight_layout()
+    _savefig(fig, out_path, dpi=140)
+
+
+def print_validation_table(points: list[PointResult]) -> None:
+    pct = lambda v: "n/a" if v is None else f"{100 * v:.0f}%"  # noqa: E731
+    print(f"{'file':<24}{'meas mm':>9}{'gate':>6}{'obj pass':>10}{'zones kept':>12}{'bg reject':>11}")
+    print("-" * 72)
+    for p in points:
+        v = p.validation
+        meas = "n/a" if p.measured_mm is None else f"{p.measured_mm:.0f}"
+        gate = "" if p.current_min_raw is None else str(p.current_min_raw)
+        print(f"{p.file:<24}{meas:>9}{gate:>6}{pct(v.get('object_pass')):>10}"
+              f"{pct(v.get('zones_kept')):>12}{pct(v.get('background_reject')):>11}")
 
 
 # --- Rendering ---------------------------------------------------------------
@@ -829,6 +1037,8 @@ def write_points_csv(points: list[PointResult], out_path: str) -> None:
         "wall_object_p_lo", "wall_leak_p_hi", "wall_recommended_min_raw",
         "wall_delta_vs_current2", "wall_flag",
     ]
+    header += [f"{mode}_footprint_row_lo" for mode in ROUND_MODES]
+    header += [f"{mode}_footprint_col_lo" for mode in ROUND_MODES]
 
     lines = [",".join(header)]
     for p in points:
@@ -870,6 +1080,9 @@ def write_points_csv(points: list[PointResult], out_path: str) -> None:
             "" if rec2["recommended"] is None else str(rec2["recommended"]),
             delta2, rec2["flag"],
         ]
+        for key in ("row_lo", "col_lo"):
+            row += ["" if p.footprints[m] is None else str(p.footprints[m][key])
+                    for m in ROUND_MODES]
         lines.append(",".join(row))
 
     with open(out_path, "w", encoding="utf-8") as f:
@@ -931,7 +1144,13 @@ def write_report_md(
         "circularly depend on the thresholds being re-derived. Three geometric "
         "footprint-rounding conventions (floor/nearest/ceil) are reported side by "
         "side; where they disagree it signals footprint-boundary ambiguity at "
-        "that distance, not a script bug. Points with no usable center-zone "
+        "that distance, not a script bug. Footprint size comes from geometry; "
+        "unless the run used `--centered-footprint`, its placement is located "
+        "from the data (the block with the highest summed median confidence "
+        "among zones at the object's distance), because the target is not "
+        "reliably centred on the bench. Zones on the footprint boundary "
+        "(`--guard-zones`, default 1) are only partly covered, so they are "
+        "excluded from the phantom set and from the wall-leak set. Points with no usable seed-zone "
         "return (dropout / beyond-range) are listed with `n/a` rather than "
         "silently dropped.\n\n"
         f"**Confidence thresholds in effect for the X-marks/resolved grid in the spatial "
@@ -1074,6 +1293,9 @@ def run_bench(
     include_wall_anchors: bool = True,
     thresholds_json: "str | None" = None,
     out_dir: "str | None" = None,
+    auto_locate: bool = True,
+    guard_zones: int = 1,
+    validate_only: bool = False,
 ) -> dict:
     """Run the full bench analysis end to end. Shared by the CLI (`main`) and
     the GUI (`veet_tof_confidence_gui.py`) -- one code path, so both stay in
@@ -1116,6 +1338,7 @@ def run_bench(
             point = analyze_point(
                 path, object_w_mm, object_h_mm, center_window,
                 obj_percentile, phantom_percentile, distance_tol_frac,
+                auto_locate=auto_locate, guard_zones=guard_zones,
             )
         except Exception as e:
             print(f"WARNING: skipping {os.path.basename(path)} -- {e}", file=sys.stderr)
@@ -1126,6 +1349,20 @@ def run_bench(
 
     if not points:
         raise ValueError("Every matched file failed to load -- see warnings above.")
+
+    validation_csv, validation_md = write_validation_outputs(points, out_dir, object_label)
+    if validate_only:
+        # Validation object (e.g. a live hand): check the gate in effect, fit
+        # nothing and write no candidate JSONs, so it can't become an anchor.
+        summary_png = os.path.join(out_dir, "validation_summary.png")
+        render_validation_png(points, summary_png, object_label)
+        return {
+            "out_dir": out_dir, "spatial_dir": spatial_dir, "n_files": len(files),
+            "points": points, "curves": {}, "candidate_jsons": {},
+            "summary_png": summary_png, "wall_summary_png": None,
+            "points_csv": validation_csv, "curve_csv": None, "report_md": validation_md,
+            "validate_only": True,
+        }
 
     curves = fit_curves(points, floor_min_raw, include_wall_anchors)
     candidate_jsons = {}
@@ -1160,6 +1397,7 @@ def run_bench(
         "points": points, "curves": curves, "candidate_jsons": candidate_jsons,
         "summary_png": summary_png, "wall_summary_png": wall_summary_png,
         "points_csv": points_csv, "curve_csv": curve_csv, "report_md": report_md,
+        "validation_csv": validation_csv, "validate_only": False,
     }
 
 
@@ -1180,7 +1418,18 @@ def main() -> None:
     parser.add_argument("--object-h-mm", type=float, default=125.0,
                          help="Object height as presented to the sensor (vertical/rows)")
     parser.add_argument("--center-window", type=int, default=2,
-                         help="NxN center block used for the first-pass distance estimate")
+                         help="NxN seed block used for the first-pass distance estimate "
+                              "(placed on the brightest zones unless --centered-footprint)")
+    parser.add_argument("--centered-footprint", action="store_true",
+                         help="Assume the target is centred (old behaviour) instead of "
+                              "locating the seed block and footprints from the data")
+    parser.add_argument("--guard-zones", type=int, default=1,
+                         help="Rings of zones around the footprint boundary excluded as "
+                              "ambiguous from the phantom and wall-leak sets (0 = off)")
+    parser.add_argument("--validate-only", action="store_true",
+                         help="Treat this object as validation, not anchors: report how the "
+                              "gate in effect (or --thresholds-json) treats it; no fit, no "
+                              "candidate JSONs")
     parser.add_argument("--obj-percentile", type=float, default=10.0,
                          help="Low percentile of footprint-zone confidence")
     parser.add_argument("--phantom-percentile", type=float, default=95.0,
@@ -1211,13 +1460,18 @@ def main() -> None:
             phantom_percentile=args.phantom_percentile, distance_tol_frac=args.distance_tol_frac,
             floor_min_raw=args.floor_min_raw,
             include_wall_anchors=not args.no_wall_anchors, thresholds_json=args.thresholds_json, out_dir=args.out_dir,
+            auto_locate=not args.centered_footprint, guard_zones=args.guard_zones,
+            validate_only=args.validate_only,
         )
     except ValueError as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
 
     print()
-    print_console_table(result["points"])
+    if result["validate_only"]:
+        print_validation_table(result["points"])
+    else:
+        print_console_table(result["points"])
     print()
     print(f"Wrote report to {result['out_dir']}")
 
